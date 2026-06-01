@@ -14,6 +14,12 @@ let refreshInterval = null;
 // Current active conversation: { type: "dm"|"channel", id: <username|channelId> }
 let activeConvo = null;
 
+// Monotonic counter incremented each time loadDmHistory / loadChannelHistory
+// is invoked. Async work checks against this so a stale load (user already
+// switched to a different chat) bails out instead of writing into the
+// freshly-cleared cache or the wrong messagesDiv.
+let loadHistoryToken = 0;
+
 let peerPublicKeys = {};   // username -> Uint8Array public key
 let messageCache = {};     // convoKey -> [{id, sender, text, timestamp}]
 let channelsList = [];     // [{id, name, created_by, members}]
@@ -410,6 +416,7 @@ async function refreshActiveConvo() {
 // --- DM history ---
 
 async function loadDmHistory(peer) {
+    const myToken = ++loadHistoryToken;
     const key = convoKey("dm", peer);
     messagesDiv.innerHTML = "";
 
@@ -417,7 +424,9 @@ async function loadDmHistory(peer) {
     messageCache[key] = [];
 
     const res = await fetch(`/api/messages/${peer}?token=${token}`);
+    if (myToken !== loadHistoryToken) return;
     const msgs = await res.json();
+    if (myToken !== loadHistoryToken) return;
 
     for (const m of msgs) {
         let text = null, imageUrl = null;
@@ -429,6 +438,10 @@ async function loadDmHistory(peer) {
         } catch (e) {
             text = "[unable to decrypt]";
         }
+        if (myToken !== loadHistoryToken) return;
+        // An incoming WS message could have raced into messageCache while we
+        // were decrypting; skip duplicates so we don't double-render.
+        if (messageCache[key].some(e => e.id === m.id)) continue;
         const entry = { id: m.id, sender: m.sender, text, imageUrl, timestamp: m.timestamp };
         messageCache[key].push(entry);
         renderMessage(entry);
@@ -439,6 +452,7 @@ async function loadDmHistory(peer) {
 // --- Channel history ---
 
 async function loadChannelHistory(channelId) {
+    const myToken = ++loadHistoryToken;
     const key = convoKey("channel", channelId);
     messagesDiv.innerHTML = "";
 
@@ -446,7 +460,9 @@ async function loadChannelHistory(channelId) {
     messageCache[key] = [];
 
     const res = await fetch(`/api/channels/${channelId}/messages?token=${token}`);
+    if (myToken !== loadHistoryToken) return;
     const msgs = await res.json();
+    if (myToken !== loadHistoryToken) return;
 
     for (const m of msgs) {
         let text = null, imageUrl = null;
@@ -465,6 +481,9 @@ async function loadChannelHistory(channelId) {
         } catch (e) {
             text = "[unable to decrypt]";
         }
+        if (myToken !== loadHistoryToken) return;
+        // Skip duplicates from a WS message that arrived mid-load.
+        if (messageCache[key].some(e => e.id === m.id)) continue;
         const entry = { id: m.id, sender: m.sender, text, imageUrl, timestamp: m.timestamp };
         messageCache[key].push(entry);
         renderMessage(entry);
