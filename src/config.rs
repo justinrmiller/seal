@@ -69,9 +69,16 @@ fn default_image_size_mb() -> usize {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
-        let project_root = Self::project_root();
-        let _ = dotenvy::from_path(project_root.join(".env"));
+        // Load .env. If SEAL_PROJECT_ROOT is set, look there explicitly;
+        // otherwise walk up from CWD (standard dotenvy behavior). Missing
+        // .env is fine — env vars may already be set in the process.
+        if let Ok(dir) = std::env::var("SEAL_PROJECT_ROOT") {
+            let _ = dotenvy::from_path(PathBuf::from(&dir).join(".env"));
+        } else {
+            let _ = dotenvy::dotenv();
+        }
 
+        let project_root = Self::project_root();
         let yaml_text = Self::read_yaml_or_embedded(&project_root)?;
         let yaml: YamlConfig = serde_yml::from_str(&yaml_text)?;
 
@@ -174,13 +181,49 @@ impl Config {
         }
     }
 
+    /// Where to look for an on-disk `config.yaml` and what to anchor relative
+    /// `DATABASE_PATH` values to. Honors `SEAL_PROJECT_ROOT`; otherwise falls
+    /// back to the process's current working directory so a deployed binary
+    /// picks up files next to wherever it's invoked from.
     fn project_root() -> PathBuf {
         if let Ok(dir) = std::env::var("SEAL_PROJECT_ROOT") {
             return PathBuf::from(dir);
         }
-        // Resolve relative to CARGO_MANIFEST_DIR at compile time, falling back to CWD.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        Path::new(manifest_dir).to_path_buf()
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate process-global env state.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn project_root_honors_env_override_and_falls_back_to_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("SEAL_PROJECT_ROOT").ok();
+
+        std::env::set_var("SEAL_PROJECT_ROOT", "/tmp/seal-test-root-xyz");
+        assert_eq!(
+            Config::project_root(),
+            PathBuf::from("/tmp/seal-test-root-xyz"),
+            "SEAL_PROJECT_ROOT should take precedence"
+        );
+
+        std::env::remove_var("SEAL_PROJECT_ROOT");
+        assert_eq!(
+            Config::project_root(),
+            std::env::current_dir().expect("cwd"),
+            "without SEAL_PROJECT_ROOT, project_root should be CWD"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SEAL_PROJECT_ROOT", v),
+            None => std::env::remove_var("SEAL_PROJECT_ROOT"),
+        }
     }
 }
 
