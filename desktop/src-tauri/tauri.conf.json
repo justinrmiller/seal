@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "E2E Chat",
+  "version": "0.1.0",
+  "identifier": "com.e2echat.desktop",
+  "build": {
+    "frontendDist": "../src",
+    "devUrl": "http://localhost:8000"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "E2E Encrypted Chat",
+        "width": 1100,
+        "height": 750,
+        "resizable": true,
+        "minWidth": 800,
+        "minHeight": 500
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* ws://localhost:*"
+    }
+  }
+}

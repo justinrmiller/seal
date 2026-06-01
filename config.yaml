@@ -1,0 +1,18 @@
+app:
+  title: "Seal"
+  host: "0.0.0.0"
+  port: 8000
+
+database:
+  path: "data/chat.lance"
+
+auth:
+  jwt_algorithm: "HS256"
+  token_expire_minutes: 1440  # 24 hours
+
+validation:
+  username_max_length: 64
+  id_max_length: 128
+
+attachments:
+  max_image_size_mb: 5

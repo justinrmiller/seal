@@ -1,0 +1,10 @@
+[project]
+name = "seal-bots"
+version = "0.2.0"
+description = "Python client utilities for Seal (bot simulator only — server is Rust)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pynacl>=1.6.2",
+    "requests>=2.33.0",
+]

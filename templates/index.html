@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Seal</title>
+        <link rel="stylesheet" href="/static/style.css" />
+    </head>
+    <body>
+        <!-- Auth Screen -->
+        <div id="auth-screen">
+            <div class="auth-box">
+                <div class="lock-icon">&#129453;</div>
+                <h1>Seal</h1>
+                <p class="subtitle">
+                    End-to-end encrypted with libsodium<br />Powered by FastAPI
+                    and LanceDB
+                </p>
+                <input
+                    type="text"
+                    id="auth-username"
+                    placeholder="Username"
+                    autocomplete="username"
+                />
+                <input
+                    type="password"
+                    id="auth-password"
+                    placeholder="Password"
+                    autocomplete="current-password"
+                />
+                <button id="btn-register">Create Account</button>
+                <button id="btn-login">Sign In</button>
+                <div class="key-actions">
+                    <button
+                        id="btn-import-keys"
+                        class="btn-key"
+                        title="Import encryption keys from a file"
+                    >
+                        Import Keys
+                    </button>
+                    <button
+                        id="btn-export-keys-auth"
+                        class="btn-key"
+                        title="Export encryption keys for the entered username"
+                    >
+                        Export Keys
+                    </button>
+                    <input
+                        type="file"
+                        id="key-file-input"
+                        accept=".json"
+                        style="display: none"
+                    />
+                </div>
+                <p class="error" id="auth-error"></p>
+            </div>
+        </div>
+
+        <!-- Chat Screen -->
+        <div id="chat-screen">
+            <div class="chat-layout">
+                <div class="sidebar">
+                    <div class="sidebar-header">
+                        <h2>Conversations</h2>
+                        <div class="sidebar-header-right">
+                            <span class="user-badge" id="current-user"></span>
+                            <button class="btn-icon" id="btn-export-keys" title="Export encryption keys">&#128273;</button>
+                            <button class="btn-icon" id="btn-logout" title="Sign out">&#x23FB;</button>
+                        </div>
+                    </div>
+
+                    <!-- Channels section -->
+                    <div class="sidebar-section">
+                        <div class="section-header">
+                            <span>Channels</span>
+                            <div style="display:flex;gap:4px">
+                                <button class="btn-icon" id="btn-browse-channels" title="Browse channels">&#x1F50D;</button>
+                                <button class="btn-icon" id="btn-create-channel" title="Create channel">+</button>
+                            </div>
+                        </div>
+                        <div id="channel-list" class="item-list"></div>
+                    </div>
+
+                    <!-- DMs section -->
+                    <div class="sidebar-section">
+                        <div class="section-header">
+                            <span>Direct Messages</span>
+                        </div>
+                        <div style="padding:0.3rem 0.5rem">
+                            <input type="text" id="dm-search" placeholder="Find user..." autocomplete="off" style="width:100%;padding:0.4rem 0.6rem;border:1px solid #333;border-radius:6px;background:#0f0f1a;color:#e0e0e0;font-size:0.8rem">
+                            <div id="dm-search-results" class="item-list"></div>
+                        </div>
+                        <div id="user-list" class="item-list"></div>
+                    </div>
+                </div>
+
+                <div class="chat-area">
+                    <div id="no-chat" class="no-chat-selected">
+                        Select a user or channel to start chatting
+                    </div>
+                    <div
+                        id="chat-with"
+                        style="display: none; flex-direction: column; flex: 1"
+                    >
+                        <div class="chat-header">
+                            <span id="chat-header-name"></span>
+                            <span class="e2e-badge">E2E Encrypted</span>
+                            <button class="btn-icon" id="btn-invite" title="Invite member" style="display:none">&#x2795;</button>
+                            <span id="chat-header-info" class="chat-header-info"></span>
+                        </div>
+                        <div class="messages" id="messages"></div>
+                        <div id="image-preview" class="image-preview" style="display:none">
+                            <img id="image-preview-img" />
+                            <span id="image-preview-name"></span>
+                            <button id="image-preview-cancel" class="btn-icon" title="Remove image">&times;</button>
+                        </div>
+                        <div class="input-bar">
+                            <label class="btn-icon btn-attach" title="Attach image">
+                                &#128247;
+                                <input type="file" id="image-input" accept="image/*" style="display:none" />
+                            </label>
+                            <input
+                                type="text"
+                                id="msg-input"
+                                placeholder="Type a message..."
+                                autocomplete="off"
+                            />
+                            <button id="send-btn">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Create Channel Modal -->
+        <div id="modal-overlay" class="modal-overlay" style="display: none">
+            <div class="modal">
+                <h3>Create Channel</h3>
+                <input
+                    type="text"
+                    id="channel-name-input"
+                    placeholder="Channel name"
+                />
+                <div class="modal-label">Add members:</div>
+                <div id="member-checkboxes" class="member-checkboxes"></div>
+                <div class="modal-actions">
+                    <button id="btn-modal-cancel" class="btn-secondary">
+                        Cancel
+                    </button>
+                    <button id="btn-modal-create" class="btn-primary">
+                        Create
+                    </button>
+                </div>
+                <p class="error" id="modal-error"></p>
+            </div>
+        </div>
+
+        <!-- Browse Channels Modal -->
+        <div id="browse-channels-modal" class="modal-overlay" style="display:none">
+            <div class="modal">
+                <h3>Browse Channels</h3>
+                <div id="browse-channels-list" class="member-checkboxes"></div>
+                <div class="modal-actions">
+                    <button id="btn-browse-close" class="btn-secondary">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Invite Modal -->
+        <div id="invite-modal" class="modal-overlay" style="display:none">
+            <div class="modal">
+                <h3>Invite to Channel</h3>
+                <div id="invite-checkboxes" class="member-checkboxes"></div>
+                <div class="modal-actions">
+                    <button id="btn-invite-cancel" class="btn-secondary">Cancel</button>
+                    <button id="btn-invite-confirm" class="btn-primary">Invite</button>
+                </div>
+                <p class="error" id="invite-error"></p>
+            </div>
+        </div>
+
+        <!-- Key Password Modal -->
+        <div
+            id="key-password-modal"
+            class="modal-overlay"
+            style="display: none"
+        >
+            <div class="modal">
+                <h3 id="key-password-title">Enter password</h3>
+                <input
+                    type="password"
+                    id="key-password-input"
+                    placeholder="Backup password"
+                    autocomplete="off"
+                />
+                <div class="modal-actions">
+                    <button id="btn-key-password-cancel" class="btn-secondary">
+                        Cancel
+                    </button>
+                    <button id="btn-key-password-ok" class="btn-primary">
+                        OK
+                    </button>
+                </div>
+                <p class="error" id="key-password-error"></p>
+            </div>
+        </div>
+
+        <!-- libsodium (vendored, no external dependencies) -->
+        <script src="/static/vendor/sodium.js"></script>
+        <script src="/static/crypto.js"></script>
+        <script src="/static/app.js"></script>
+    </body>
+</html>
