@@ -1,0 +1,14 @@
+target/
+desktop/target/
+desktop/src-tauri/target/
+.git/
+data/
+*.lance
+.env
+.env.*
+!.env.example
+**/__pycache__/
+*.pyc
+.DS_Store
+.venv/
+node_modules/

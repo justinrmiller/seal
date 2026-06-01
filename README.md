@@ -53,6 +53,46 @@ The workflow definition lives at [`.github/workflows/release.yml`](.github/workf
 and can also be invoked manually via the **Actions → Build & Pre-release → Run
 workflow** button on GitHub.
 
+## Deploy to DigitalOcean
+
+[`scripts/deploy-digitalocean.sh`](scripts/deploy-digitalocean.sh) is an
+interactive deploy script that ships the server to [DigitalOcean App
+Platform](https://www.digitalocean.com/products/app-platform) using `doctl`.
+
+Prerequisites:
+
+- [`doctl`](https://docs.digitalocean.com/reference/doctl/how-to/install/) installed and authenticated (`doctl auth init`)
+- The repo pushed to GitHub (App Platform builds from a GitHub branch)
+- A [`Dockerfile`](Dockerfile) at the repo root (shipped with the script —
+  multi-stage Rust build, no Rust buildpack exists on App Platform)
+
+Run it:
+
+```bash
+./scripts/deploy-digitalocean.sh
+```
+
+The script prompts for app name, GitHub repo, branch, region, instance size,
+`APP_TITLE`, `DATABASE_PATH`, and `JWT_SECRET` (hidden input, stored as an
+encrypted env var). Defaults for branch and repo are auto-filled from your
+local git config.
+
+It then:
+
+1. Generates a DigitalOcean App Platform spec
+2. Previews it with the JWT secret redacted and asks for confirmation
+3. Runs `doctl apps create --wait` for a new app, or `doctl apps update` if an
+   app with the chosen name already exists
+4. Prints the app ID and live URL
+
+With `deploy_on_push: true` in the generated spec, subsequent pushes to the
+deployed branch automatically trigger a new build on App Platform.
+
+**Persistence note:** App Platform containers have an ephemeral filesystem by
+default, so the LanceDB directory resets on each deploy. For durable data,
+attach a persistent volume via **Apps → \<name\> → Settings → Resources → Add
+Storage** in the DigitalOcean console.
+
 ## Security Model
 
 - **Client-side encryption**: All messages are encrypted/decrypted in the browser using [libsodium](https://libsodium.gitbook.io/) (X25519 key exchange + XSalsa20-Poly1305 authenticated encryption). The server never sees plaintext.
