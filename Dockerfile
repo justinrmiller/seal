@@ -8,10 +8,16 @@ WORKDIR /build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       protobuf-compiler \
+      libprotobuf-dev \
       cmake \
       pkg-config \
       libssl-dev \
  && rm -rf /var/lib/apt/lists/*
+
+# lance-encoding's build.rs invokes protoc and imports google/protobuf/empty.proto.
+# Tell protoc where the well-known .proto files live (shipped by libprotobuf-dev).
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
