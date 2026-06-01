@@ -29,13 +29,12 @@ it anywhere, set `JWT_SECRET` and `DATABASE_PATH`, and run.
 ## Pre-built Binaries
 
 Every push to `main` triggers a GitHub Actions workflow that cross-compiles the
-server for three platforms and publishes the artifacts as a **pre-release** on
+server for two platforms and publishes the artifacts as a **pre-release** on
 the [GitHub Releases page](../../releases):
 
 | Platform | Triple | Asset |
 |----------|--------|-------|
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | `seal-server-linux-x86_64.tar.gz` |
-| macOS Intel | `x86_64-apple-darwin` | `seal-server-macos-x86_64.tar.gz` |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `seal-server-macos-aarch64.tar.gz` |
 
 Each release is tagged `build-YYYYMMDD-<short-sha>` and marked as a pre-release
