@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "seal-server",
+      "runtimeExecutable": "./target/release/seal-server",
+      "runtimeArgs": [],
+      "port": 8765,
+      "env": {
+        "JWT_SECRET": "preview-test-secret",
+        "APP_PORT": "8765",
+        "APP_HOST": "127.0.0.1",
+        "DATABASE_PATH": "/tmp/seal-preview.lance"
+      }
+    }
+  ]
+}
