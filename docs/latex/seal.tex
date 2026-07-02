@@ -1,0 +1,107 @@
+\documentclass[11pt]{report}
+
+% --- Encoding & fonts -------------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% --- Layout -----------------------------------------------------------------
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{fancyhdr}
+\usepackage{parskip}
+\usepackage{titlesec}
+
+% --- Graphics & colour ------------------------------------------------------
+\usepackage{xcolor}
+\definecolor{sealblue}{HTML}{1F6FEB}
+\definecolor{sealgray}{HTML}{57606A}
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codeframe}{HTML}{D0D7DE}
+
+% --- Tables -----------------------------------------------------------------
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+
+% --- Code listings ----------------------------------------------------------
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{codeframe},
+  backgroundcolor=\color{codebg},
+  xleftmargin=0.5em,
+  xrightmargin=0.5em,
+  aboveskip=1em,
+  belowskip=1em,
+  literate={\-}{-}1,
+}
+
+% --- Links (load last-ish) --------------------------------------------------
+\usepackage[hidelinks]{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=sealblue,
+  urlcolor=sealblue,
+  citecolor=sealblue,
+  pdftitle={Seal: A Technical Reference},
+  pdfauthor={Seal Project},
+}
+
+% --- Header / footer --------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\small\itshape Seal --- A Technical Reference}
+\fancyhead[R]{\small\thepage}
+\fancyfoot[C]{}
+
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries\color{sealblue}}
+  {\chaptertitlename\ \thechapter}{10pt}{\Huge}
+
+% --- Metadata ---------------------------------------------------------------
+\title{\Huge\bfseries Seal\\[0.4em]\Large A Technical Reference to the\\End-to-End Encrypted Chat Server}
+\author{Generated documentation for the \texttt{seal} project}
+\date{\today}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+{\Huge\bfseries\color{sealblue} Seal\par}
+\vspace{0.6cm}
+{\Large A Technical Reference\par}
+\vspace{0.3cm}
+{\large The End-to-End Encrypted Chat Server\par}
+\vspace{2cm}
+{\large Rust \textbullet\ Axum \textbullet\ LanceDB \textbullet\ libsodium \textbullet\ Tauri\par}
+\vfill
+{\large Architecture, Code Walkthrough, API Reference,\\Security Model, Testing, and Operations\par}
+\vspace{2cm}
+{\itshape Generated \today\par}
+\end{titlepage}
+
+\tableofcontents
+
+\include{chapters/01-introduction}
+\include{chapters/02-architecture}
+\include{chapters/03-configuration}
+\include{chapters/04-database}
+\include{chapters/05-http-api}
+\include{chapters/06-websocket}
+\include{chapters/07-encryption-security}
+\include{chapters/08-source-reference}
+\include{chapters/09-testing}
+\include{chapters/10-build-deploy}
+\include{chapters/11-object-storage}
+
+\end{document}

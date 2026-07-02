@@ -1,0 +1,154 @@
+\chapter{Real-Time Messaging over WebSocket}
+\label{chap:websocket}
+
+The live path is \verb|GET /ws/chat?token=<jwt>|, handled by
+\verb|src/routes/ws.rs|, backed by the connection registry in \verb|src/ws.rs|.
+REST endpoints persist and read history; the WebSocket is how a message reaches a
+recipient \emph{now}.
+
+\section{The Connection Registry}
+
+\verb|WsConnections| (\verb|src/ws.rs|) is the in-process map of who is online and
+how to reach them:
+
+\begin{lstlisting}
+pub struct WsConnections {
+    inner: Mutex<HashMap<String, Vec<(Uuid, ConnTx)>>>,
+}
+pub type ConnTx = UnboundedSender<Message>;
+\end{lstlisting}
+
+A user maps to a \emph{list} of connections because one account can be signed in
+from several devices/tabs at once. Each entry pairs a per-connection \verb|Uuid|
+with an unbounded mpsc sender that feeds that socket's writer task. The API:
+
+\begin{center}
+\begin{tabular}{@{}lp{0.62\textwidth}@{}}
+\toprule
+\textbf{Method} & \textbf{Effect} \\
+\midrule
+\verb|register(user, id, tx)| & Add a connection for \verb|user|. \\
+\verb|unregister(user, id)| & Remove it; drop the user key entirely if it was the last connection. \\
+\verb|send_to(user, payload)| & Send text to \emph{all} of \verb|user|'s connections. \\
+\verb|send_to_except(user, id, payload)| & Send to all but the connection \verb|id| --- used to echo a DM to the sender's \emph{other} devices without looping it back to the origin. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Sends are best-effort: \verb|let _ = tx.send(...)|. A dead receiver simply drops
+the frame; the connection is cleaned up when its receive loop ends. The registry
+has a thorough unit-test module (multi-connection delivery, the ``except''
+exclusion, no-op sends to unknown users, and last-connection removal).
+
+\section{Upgrade and the Per-Connection Tasks}
+
+\verb|ws_chat| decodes the token \emph{before} upgrading. An invalid token still
+upgrades but is immediately closed with code \verb|4001 "Invalid token"| --- the
+handshake completes so the client gets a clean, typed rejection rather than a
+bare HTTP error.
+
+On a valid token, \verb|handle_socket| sets up the machinery:
+
+\begin{enumerate}
+  \item Mint a \verb|conn_id: Uuid| for this socket.
+  \item Split the socket into a \verb|sink| (outbound) and \verb|stream|
+        (inbound).
+  \item Create an unbounded mpsc channel and spawn a \textbf{writer task} that
+        drains the channel into the sink. All outbound frames --- relays, acks,
+        errors --- go through this one channel, so any handler (even one running
+        for a \emph{different} user) can enqueue a frame for this socket without
+        sharing the sink.
+  \item \verb|register| the \verb|(conn_id, tx)| under the username.
+  \item Loop over inbound frames until the stream ends or a close frame arrives.
+  \item On exit, \verb|unregister|, drop the sender, and await the writer task.
+\end{enumerate}
+
+\section{Frame Dispatch}
+
+Each inbound text frame is parsed as JSON and dispatched on its \verb|"type"|
+field, defaulting to \verb|"dm"|:
+
+\begin{lstlisting}
+match data.get("type").and_then(|v| v.as_str()).unwrap_or("dm") {
+    "channel" => handle_channel(...).await,
+    _         => handle_dm(...).await,
+}
+\end{lstlisting}
+
+Malformed JSON is logged and skipped, not fatal --- a bad frame never tears down
+the connection.
+
+\section{Direct Messages: the Double-Write}
+
+\verb|handle_dm| is where the \verb|channel_id| overloading from
+Chapter~\ref{chap:database} pays off. A DM inbound frame looks like:
+
+\begin{lstlisting}
+{
+  "type": "dm",
+  "recipient": "bob",
+  "ciphertext": "...", "iv": "...", "sender_public_key_jwk": "...",
+  "self_ciphertext": "...", "self_iv": "...", "self_sender_public_key_jwk": "..."
+}
+\end{lstlisting}
+
+The client encrypts the message \emph{twice}: once to the recipient's public key,
+once to its own. The handler therefore writes up to two rows:
+
+\begin{enumerate}
+  \item \textbf{The recipient copy} --- \verb|recipient = bob|,
+        \verb|channel_id = ''|, using \verb|ciphertext|/\verb|iv|/\verb|spk|.
+        This is what Bob reads back via \verb|GET /api/messages/alice|.
+  \item \textbf{The self copy} --- only if all three \verb|self_*| fields are
+        present --- with \verb|channel_id = 'self'|, using the \verb|self_*|
+        values. This is what Alice reads back so she can decrypt her own sent
+        history. (Because the recipient copy is encrypted to Bob's key, Alice
+        \emph{cannot} decrypt it; she needs her own copy.)
+\end{enumerate}
+
+Both rows share the same timestamp. The message id returned to the sender is the
+recipient copy's id.
+
+Relay then happens in three directions:
+
+\begin{lstlisting}
+state.ws_connections.send_to(recipient, &relay_text);          // to Bob
+state.ws_connections.send_to_except(sender, own_id, &relay_text); // Alice's OTHER devices
+own_tx.send(ack);                                              // ack to THIS socket
+\end{lstlisting}
+
+The relayed frame is a \verb|"dm"| object carrying the id, sender, recipient,
+ciphertext, iv, sender public key, timestamp, and message type. The ack is the
+same frame plus an \verb|"ack"| field holding the message id.
+
+\section{Channel Messages: Fan-Out}
+
+\verb|handle_channel| parses the frame into the very same
+\verb|ChannelMessagePayload| the REST handler uses. It verifies the sender is a
+member of \verb|payload.channel_id| (replying with an \verb|{"error": ...}| frame
+if not), then delegates to the shared functions in
+\verb|src/routes/messages.rs|:
+
+\begin{itemize}
+  \item \verb|store_channel_message| --- writes one \verb|messages| row per
+        envelope (each encrypted to a different member) plus, for an image, one
+        \verb|attachments| row. It returns a \verb|ChannelMessageStoreResult| with
+        a \verb|group_id| (shared logical-message id), the timestamp, the
+        attachment id, the resolved message type, and the per-envelope row ids.
+  \item \verb|relay_channel_message| --- iterates envelopes zipped with their row
+        ids and \verb|send_to| each \verb|target_user|, delivering each member
+        their own ciphertext.
+\end{itemize}
+
+The sender receives an ack keyed by \verb|group_id|. Because storage and relay
+are shared functions, a channel message sent over REST and one sent over the
+WebSocket are byte-for-byte equivalent in the database and to recipients --- the
+transport is an implementation detail.
+
+\section{Why This Shape}
+
+Storing a separate ciphertext per recipient (fan-out) is what keeps the server
+zero-knowledge for groups: there is no group key the server could hold. The cost
+is storage and write amplification proportional to channel size; the benefit is
+that membership changes and per-recipient delivery need no re-keying on the
+server, and the server literally cannot read the traffic it carries.

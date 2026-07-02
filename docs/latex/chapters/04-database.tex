@@ -1,0 +1,198 @@
+\chapter{The Database Layer}
+\label{chap:database}
+
+Seal persists to \textbf{LanceDB}, an embedded database built on Apache Arrow.
+There is no SQL server and no ORM. Data is modelled as Arrow \verb|RecordBatch|es
+against fixed schemas, and queries are expressed as filter predicates over
+columns. Two files carry this layer: \verb|src/db.rs| (schemas, connection,
+initialization, migration) and \verb|src/db_ops.rs| (the ergonomic helpers used
+by route handlers).
+
+\section{The Five Tables}
+
+Every schema is defined in \verb|src/db.rs| as a function returning a
+\verb|SchemaRef|. All fields are nullable (\verb|true|). Types are Arrow types:
+\verb|Utf8| (string), \verb|LargeUtf8| (large string, for big blobs), and
+\verb|Float64| (used for timestamps and, thus, sub-second precision).
+
+\subsection*{\texttt{users}}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Column} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\verb|username| & Utf8 & Unique handle (validated on write). \\
+\verb|password_hash| & Utf8 & bcrypt hash. \\
+\verb|public_key_jwk| & Utf8 & The user's public key, as a JWK string. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{\texttt{messages}}
+The busiest table. A single logical message becomes one row per recipient copy.
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Column} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\verb|id| & Utf8 & UUID of this row. \\
+\verb|sender| & Utf8 & Author username. \\
+\verb|recipient| & Utf8 & Target username. \\
+\verb|channel_id| & Utf8 & Channel UUID, or \verb|''| for a received DM, or \verb|'self'| for a DM self-copy. \\
+\verb|ciphertext| & Utf8 & libsodium ciphertext (base64/JWK-ish string). \\
+\verb|iv| & Utf8 & Nonce / IV. \\
+\verb|sender_public_key_jwk| & Utf8 & Ephemeral sender public key for this row. \\
+\verb|timestamp| & Float64 & Unix seconds, fractional. \\
+\verb|message_type| & Utf8 & \verb|"text"| or \verb|"image"|. \\
+\verb|attachment_id| & Utf8 & Attachment UUID for images, else \verb|''|. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The \verb|channel_id| column is overloaded and is the key to understanding DM
+storage (Chapter~\ref{chap:websocket}): a received DM is stored with an empty
+\verb|channel_id|, while the sender's own decryptable copy is stored with
+\verb|channel_id = 'self'|.
+
+\subsection*{\texttt{attachments}}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Column} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\verb|id| & Utf8 & UUID. \\
+\verb|sender| & Utf8 & Uploader. \\
+\verb|channel_id| & Utf8 & Owning channel (drives the access check). \\
+\verb|encrypted_data| & LargeUtf8 & The encrypted image payload. \\
+\verb|iv| & Utf8 & Nonce / IV. \\
+\verb|timestamp| & Float64 & Unix seconds. \\
+\bottomrule
+\end{tabular}
+\end{center}
+\verb|encrypted_data| is \verb|LargeUtf8| specifically because image ciphertext
+can exceed the 2\,GiB offset limit of the ordinary \verb|Utf8| array type.
+
+\subsection*{\texttt{channels} and \texttt{channel\_members}}
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Table.Column} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\verb|channels.id| & Utf8 & Channel UUID. \\
+\verb|channels.name| & Utf8 & Unique, human name. \\
+\verb|channels.created_by| & Utf8 & Creator username. \\
+\verb|channels.created_at| & Float64 & Unix seconds. \\
+\verb|channel_members.channel_id| & Utf8 & FK to \verb|channels.id|. \\
+\verb|channel_members.username| & Utf8 & Member. \\
+\verb|channel_members.joined_at| & Float64 & Unix seconds. \\
+\bottomrule
+\end{tabular}
+\end{center}
+Membership is a plain join table; there is no uniqueness constraint enforced by
+the store, so handlers check for duplicates in application code before inserting.
+
+\section{Connecting and Initializing}
+
+\verb|connect| opens (or creates) the database at a filesystem path:
+
+\begin{lstlisting}
+pub async fn connect(path: &std::path::Path) -> anyhow::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();   // ensure the directory exists
+    }
+    let path_str = path.to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", path.display()))?;
+    let conn = lancedb::connect(path_str).execute().await?;
+    Ok(conn)
+}
+\end{lstlisting}
+
+\begin{quote}
+\textbf{Branch note.} On \verb|main| this signature is filesystem-only. The
+\verb|feat/object-storage| branch extends it to accept storage options and to
+skip directory creation for \verb|s3://|, \verb|gs://|, \verb|az://| URIs.
+See Chapter~\ref{chap:object-storage}.
+\end{quote}
+
+\verb|init_db| is idempotent. It lists existing tables and creates any that are
+missing with \verb|create_empty_table|. Crucially, if the \verb|messages| table
+already exists, it runs a migration instead of skipping:
+
+\begin{lstlisting}
+if !existing.contains("messages") {
+    conn.create_empty_table("messages", messages_schema()).execute().await?;
+} else {
+    migrate_messages_table(conn).await?;
+}
+\end{lstlisting}
+
+\section{The Messages Migration}
+
+\verb|migrate_messages_table| mirrors an earlier Python migration. It inspects the
+live schema and, if the \verb|message_type| or \verb|attachment_id| columns are
+absent (as they would be in a database created by an older build), adds them with
+SQL default expressions:
+
+\begin{lstlisting}
+if !field_names.contains("message_type") {
+    new_columns.push(("message_type".to_string(), "'text'".to_string()));
+}
+if !field_names.contains("attachment_id") {
+    new_columns.push(("attachment_id".to_string(), "''".to_string()));
+}
+// ...
+tbl.add_columns(NewColumnTransform::SqlExpressions(new_columns), None).await?;
+\end{lstlisting}
+
+If both columns are already present the function returns early, so re-running it
+is a no-op --- a property the migration tests assert directly.
+
+\section{\texttt{db\_ops}: The Query Toolkit}
+
+Route code never touches LanceDB's Arrow machinery directly. Instead it uses a
+small vocabulary of helpers in \verb|src/db_ops.rs|, each of which maps LanceDB
+errors into \verb|AppError::Internal|:
+
+\begin{center}
+\begin{longtable}{@{}p{0.34\textwidth}p{0.58\textwidth}@{}}
+\toprule
+\textbf{Helper} & \textbf{Purpose} \\
+\midrule
+\endhead
+\verb|open(conn, name)| & Open a table by name. \\
+\verb|scan_where(tbl, pred, limit)| & Run a filtered scan (\verb|only_if(pred)|) and collect all matching \verb|RecordBatch|es, optionally capped by \verb|limit|. \\
+\verb|append(tbl, batch)| & Append a one-batch set of rows. \\
+\verb|first_string(batches, col)| & First value of a \verb|Utf8| column from the first non-empty batch (null $\to$ empty string, missing $\to$ \verb|None|). \\
+\verb|first_large_string(batches, col)| & Same, for \verb|LargeUtf8| columns. \\
+\verb|collect_string_column(batches, col)| & Every non-null value of a \verb|Utf8| column across all batches. \\
+\verb|total_rows(batches)| & Sum of row counts --- the ``does anything match?'' primitive. \\
+\verb|utf8_row(schema, fields)| & Build a single all-\verb|Utf8| row from \verb|(name, value)| pairs, matched to the schema by field name. \\
+\verb|mixed_row(schema, cells)| & Build a single row from an ordered slice of \verb|Cell::{Str, LargeStr, F64}| values. \\
+\verb|rows_to_stored_messages(batches)| & Materialize \verb|messages|-table rows into the API's \verb|StoredMessage| shape. \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+The \verb|Cell| enum is the trick that lets \verb|mixed_row| build heterogeneous
+rows (strings, large strings, and \verb|f64| timestamps) without bespoke builder
+code at each call site:
+
+\begin{lstlisting}
+pub enum Cell<'a> { Str(&'a str), LargeStr(&'a str), F64(f64) }
+\end{lstlisting}
+
+\verb|mixed_row| validates that the number of cells matches the schema's field
+count and returns \verb|AppError::Internal| otherwise --- a guard the unit tests
+exercise. \verb|db_ops.rs| carries an extensive \verb|#[cfg(test)]| module that
+covers row building, null handling, wrong-type handling, and the
+\verb|StoredMessage| materializer.
+
+\section{A Word on Query Safety}
+
+Predicates are built with \verb|format!| string interpolation, e.g.
+\verb|format!("username = '{username}'")|. This is safe here \emph{because} every
+interpolated identifier is first passed through the validation guards
+(\S\ref{chap:security}), which restrict usernames and IDs to
+\verb|[A-Za-z0-9_-]|. No quote, space, or SQL metacharacter can reach a
+predicate, so there is no injection surface. New handlers must preserve this
+invariant: validate before you interpolate.

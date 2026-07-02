@@ -1,0 +1,153 @@
+\chapter{Configuration}
+\label{chap:config}
+
+All configuration lives in \verb|src/config.rs|. The public product is a single
+immutable \verb|Config| struct, resolved once at startup and shared through
+\verb|AppState| as \verb|Arc<Config>|.
+
+\section{The Three-Layer Cascade}
+
+Values are resolved in ascending order of precedence:
+
+\begin{enumerate}
+  \item \textbf{Embedded defaults.} The repository's \verb|config.yaml| is baked
+        into the binary at compile time:
+\begin{lstlisting}
+const EMBEDDED_CONFIG_YAML: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml"));
+\end{lstlisting}
+        This guarantees the binary is runnable with no external files.
+  \item \textbf{On-disk \texttt{config.yaml}.} If a \verb|config.yaml| exists at
+        the project root, it is read \emph{instead of} the embedded copy (it
+        wholly replaces it; the two are not merged). See
+        \verb|read_yaml_or_embedded|.
+  \item \textbf{Environment variables.} Individual fields are then overridden by
+        env vars, which always win.
+\end{enumerate}
+
+\section{The YAML Shape}
+
+The default \verb|config.yaml|:
+
+\begin{lstlisting}
+app:
+  title: "Seal"
+  host: "0.0.0.0"
+  port: 8000
+
+database:
+  path: "data/chat.lance"
+
+auth:
+  jwt_algorithm: "HS256"
+  token_expire_minutes: 1440  # 24 hours
+
+validation:
+  username_max_length: 64
+  id_max_length: 128
+
+attachments:
+  max_image_size_mb: 5
+\end{lstlisting}
+
+These map to the private \verb|YamlConfig| deserialization structs
+(\verb|AppSection|, \verb|DatabaseSection|, \verb|AuthSection|,
+\verb|ValidationSection|, \verb|AttachmentsSection|). The \verb|attachments|
+section is \verb|#[serde(default)]| with a per-field default of 5 MB
+(\verb|default_image_size_mb|), so older config files without it still parse.
+
+\section{Environment Variables}
+
+\begin{center}
+\begin{longtable}{@{}llp{0.40\textwidth}@{}}
+\toprule
+\textbf{Variable} & \textbf{Overrides} & \textbf{Notes} \\
+\midrule
+\endhead
+\verb|JWT_SECRET| & (required) & HMAC signing secret. If unset, defaults to \verb|"change-me"| and logs a warning --- development only. \\
+\verb|APP_TITLE| & \verb|app.title| & \\
+\verb|APP_HOST| & \verb|app.host| & \\
+\verb|APP_PORT| & \verb|app.port| & Parsed to \verb|u16|; an unparseable value fails startup. \\
+\verb|DATABASE_PATH| & \verb|database.path| & Relative $\to$ anchored to project root; absolute $\to$ used verbatim. \\
+\verb|AUTH_JWT_ALGORITHM| & \verb|auth.jwt_algorithm| & \verb|HS256|, \verb|HS384|, or \verb|HS512|. \\
+\verb|AUTH_TOKEN_EXPIRE_MINUTES| & \verb|auth.token_expire_minutes| & Parsed to \verb|i64|. \\
+\verb|SEAL_PROJECT_ROOT| & (see below) & Where to look for \verb|.env| / \verb|config.yaml| and what to anchor relative DB paths to. \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\verb|env_or| and \verb|env_or_parse| implement the override: the former returns
+the env value or a default string; the latter additionally parses to a target
+type and turns parse failures into a startup error rather than silently falling
+back.
+
+\section{\texttt{.env} Loading and the Project Root}
+
+\verb|Config::load| begins by loading a \verb|.env| file (via \verb|dotenvy|):
+
+\begin{lstlisting}
+if let Ok(dir) = std::env::var("SEAL_PROJECT_ROOT") {
+    let _ = dotenvy::from_path(PathBuf::from(&dir).join(".env"));
+} else {
+    let _ = dotenvy::dotenv();   // walk up from CWD
+}
+\end{lstlisting}
+
+A missing \verb|.env| is not an error --- the variables may already be present in
+the process environment (as in Docker or CI). \verb|project_root| then honours
+\verb|SEAL_PROJECT_ROOT| if set, otherwise falls back to the current working
+directory. This anchor determines both where an on-disk \verb|config.yaml| is
+sought and how a relative \verb|DATABASE_PATH| is resolved:
+
+\begin{lstlisting}
+let database_path = PathBuf::from(env_or("DATABASE_PATH", &yaml.database.path));
+let database_path = if database_path.is_absolute() {
+    database_path
+} else {
+    project_root.join(database_path)
+};
+\end{lstlisting}
+
+\section{Derived Fields}
+
+\verb|Config::load| does more than copy strings:
+
+\begin{itemize}
+  \item \verb|max_image_size_bytes| is computed as
+        \verb|max_image_size_mb * 1024 * 1024|.
+  \item \verb|safe_name_re| and \verb|safe_id_re| are compiled once from the
+        configured maximum lengths:
+\begin{lstlisting}
+let safe_name_re = Regex::new(&format!(
+    r"^[a-zA-Z0-9_\-]{{1,{}}}$", yaml.validation.username_max_length))?;
+\end{lstlisting}
+        Compiling the regexes here (rather than per request) means every
+        validation call is a cheap match against a prebuilt automaton. See
+        Chapter~\ref{chap:security} for how they are used.
+  \item The \verb|jwt_secret| default emits a \verb|tracing::warn!| so a
+        production deployment that forgets to set it is at least noisy.
+\end{itemize}
+
+\section{\texttt{Config::for\_test}}
+
+A second constructor exists purely for tests:
+
+\begin{lstlisting}
+pub fn for_test(database_path: PathBuf, jwt_secret: String) -> anyhow::Result<Self>
+\end{lstlisting}
+
+It builds a \verb|Config| from the YAML but takes the database path and JWT
+secret as explicit arguments and \emph{ignores all environment variables}.
+Because Rust's test harness runs tests in parallel within one process, reading
+process-global env state would race; \verb|for_test| sidesteps that entirely.
+This is the constructor the integration harness in \verb|tests/common/mod.rs|
+uses.
+
+\section{Configuration Unit Tests}
+
+\verb|src/config.rs| carries its own \verb|#[cfg(test)]| module that serializes
+env-mutating tests behind a \verb|Mutex| and snapshots/restores the relevant
+variables around each case. It verifies: \verb|project_root| precedence, the
+embedded-defaults path, env overrides (including that an absolute
+\verb|DATABASE_PATH| is used verbatim), and that an unparseable \verb|APP_PORT|
+fails \verb|load()|.

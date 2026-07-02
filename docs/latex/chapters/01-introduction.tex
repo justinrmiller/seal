@@ -1,0 +1,90 @@
+\chapter{Introduction}
+
+\section{What Seal Is}
+
+Seal is a fully end-to-end encrypted (E2EE) chat application. It offers direct
+messages (DMs) and group channels, an attachment path for encrypted images, and
+both a browser client and a native desktop client. The component documented in
+this reference is the \emph{server}: a single, self-contained Rust binary named
+\verb|seal-server| built on the \href{https://github.com/tokio-rs/axum}{Axum} web
+framework, with persistence provided by \href{https://lancedb.github.io/lancedb/}{LanceDB},
+an embedded columnar/vector database built on Apache Arrow.
+
+The defining property of Seal is that \textbf{the server never sees plaintext}.
+All encryption and decryption happens on the client using
+\href{https://libsodium.gitbook.io/doc/}{libsodium}. The server stores and relays
+opaque ciphertext, public keys (which are, by definition, public), and routing
+metadata (who sent what to whom, and when). Private keys never leave the client.
+This makes Seal a \emph{zero-knowledge relay}: a database or server compromise
+exposes ciphertext and social graph metadata, but not message contents.
+
+\section{Design Goals}
+
+\begin{itemize}
+  \item \textbf{Zero-knowledge server.} The server is a dumb, trustworthy pipe.
+        It authenticates users, enforces channel membership, rate-limits abuse,
+        and persists ciphertext --- nothing more. It holds no decryption keys.
+  \item \textbf{Single static binary.} \verb|templates/|, \verb|static/|, and the
+        default \verb|config.yaml| are compiled \emph{into} the binary via
+        \verb|include_dir!| / \verb|include_str!|. The release artifact at
+        \verb|target/release/seal-server| can be copied anywhere, given a
+        \verb|JWT_SECRET| and a \verb|DATABASE_PATH|, and run.
+  \item \textbf{Faithful port.} The server is a Rust port of an earlier FastAPI
+        (Python) application. Many functions carry comments such as
+        ``Mirrors \texttt{app/main.py}'' precisely because behaviour --- error
+        strings, status codes, bcrypt hash format --- was kept wire-compatible
+        with the Python original and its test suite.
+  \item \textbf{Testability.} The bootstrap path is factored so integration tests
+        spin up the \emph{real} router against a throwaway database on a random
+        port. The suite exercises the HTTP and WebSocket surface end to end.
+\end{itemize}
+
+\section{Technology Stack}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Concern} & \textbf{Technology} \\
+\midrule
+HTTP / routing / WebSocket & Axum 0.8 on Tokio \\
+Persistence & LanceDB 0.30 (Apache Arrow, \verb|arrow-array| 58) \\
+Password hashing & bcrypt (\verb|DEFAULT_COST|) \\
+Session tokens & JSON Web Tokens (HS256/384/512) \\
+Client-side crypto & libsodium (X25519 + secretbox), in the browser/desktop \\
+Config & YAML (\verb|serde_yml|) with environment-variable overrides \\
+Asset bundling & \verb|include_dir| / \verb|include_str| \\
+Logging & \verb|tracing| + \verb|tracing-subscriber| \\
+Desktop client & Tauri v2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{A Note on Scope and Branch}
+
+This reference documents the code on the \verb|main| branch. The repository also
+carries a \verb|feat/object-storage| feature branch that teaches the database
+layer to talk to S3, GCS, and Azure Blob Storage instead of the local
+filesystem. That work is not yet merged into \verb|main|; on \verb|main| the
+database connector is filesystem-only. Chapter~\ref{chap:object-storage}
+describes the object-storage feature and clearly marks which parts live only on
+the feature branch, so the picture is complete without misrepresenting what
+\verb|main| actually compiles.
+
+\section{How to Read This Book}
+
+\begin{itemize}
+  \item Chapter~\ref{chap:architecture} gives the 30{,}000-foot view: the
+        three-layer model, \verb|AppState|, and a request's lifecycle.
+  \item Chapters~\ref{chap:config}--\ref{chap:websocket} drill into the
+        subsystems: configuration, the database, the REST API, and WebSockets.
+  \item Chapter~\ref{chap:security} explains the cryptographic model and the
+        server-side defences (auth, rate limiting, validation).
+  \item Chapter~\ref{chap:source} is a module-by-module code walkthrough ---
+        the reference you reach for when editing a specific file.
+  \item Chapters~\ref{chap:testing}--\ref{chap:object-storage} cover the test
+        suite, build and deployment, and the object-storage backend.
+\end{itemize}
+
+Throughout, inline identifiers such as \verb|db_ops::scan_where| and file paths
+such as \verb|src/routes/messages.rs| point directly at the source so you can
+jump from prose to code.
