@@ -238,3 +238,89 @@ async fn channel_message_non_member_gets_error() {
     let resp = recv_json(&mut ws_bob).await;
     assert!(resp.get("error").is_some(), "got: {resp}");
 }
+
+/// After a subsequent valid DM is acked, the connection clearly survived
+/// whatever was sent before it — a shared assertion for the "ignore" cases.
+async fn assert_dm_still_acked(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    send_json(
+        ws,
+        json!({
+            "type": "dm",
+            "recipient": "bob",
+            "ciphertext": "c",
+            "iv": "i",
+            "sender_public_key_jwk": "k",
+        }),
+    )
+    .await;
+    let ack = recv_json(ws).await;
+    assert!(ack.get("ack").is_some(), "expected an ack, got: {ack}");
+}
+
+#[tokio::test]
+async fn ws_ignores_non_text_frames_and_stays_open() {
+    let s = TestServer::spawn().await;
+    let alice = register(&s, "alice").await;
+    register(&s, "bob").await;
+    let mut ws = open_ws(&s, &alice).await;
+
+    // A binary frame hits the `_ => continue` arm and must not disturb the loop.
+    // (Unlike a ping, it produces no protocol-level response frame to the client.)
+    ws.send(Message::Binary(vec![1, 2, 3].into()))
+        .await
+        .unwrap();
+    assert_dm_still_acked(&mut ws).await;
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_ignores_malformed_json_and_stays_open() {
+    let s = TestServer::spawn().await;
+    let alice = register(&s, "alice").await;
+    register(&s, "bob").await;
+    let mut ws = open_ws(&s, &alice).await;
+
+    // Non-JSON text is logged and skipped, not fatal.
+    ws.send(Message::Text("this is not json".into()))
+        .await
+        .unwrap();
+    assert_dm_still_acked(&mut ws).await;
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_dm_without_recipient_returns_error() {
+    let s = TestServer::spawn().await;
+    let alice = register(&s, "alice").await;
+    let mut ws = open_ws(&s, &alice).await;
+
+    // Missing `recipient` -> the "Invalid DM payload" error branch.
+    send_json(&mut ws, json!({"type": "dm", "ciphertext": "c"})).await;
+    let resp = recv_json(&mut ws).await;
+    assert_eq!(resp["error"], "Invalid DM payload");
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn ws_channel_malformed_payload_returns_error() {
+    let s = TestServer::spawn().await;
+    let alice = register(&s, "alice").await;
+    let mut ws = open_ws(&s, &alice).await;
+
+    // `envelopes` is required by ChannelMessagePayload; omitting it makes the
+    // payload fail to deserialize -> the "Invalid channel payload" branch.
+    send_json(&mut ws, json!({"type": "channel", "channel_id": "x"})).await;
+    let resp = recv_json(&mut ws).await;
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid channel payload"),
+        "got: {resp}"
+    );
+    ws.close(None).await.unwrap();
+}

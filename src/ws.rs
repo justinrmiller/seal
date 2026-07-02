@@ -55,3 +55,81 @@ impl WsConnections {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::{self, UnboundedReceiver};
+
+    fn conn() -> (Uuid, ConnTx, UnboundedReceiver<Message>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Uuid::new_v4(), tx, rx)
+    }
+
+    /// Drain a receiver into the list of text payloads it currently holds.
+    fn drain(rx: &mut UnboundedReceiver<Message>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let Message::Text(t) = msg {
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn send_to_reaches_every_connection_of_a_user() {
+        let conns = WsConnections::new();
+        let (id1, tx1, mut rx1) = conn();
+        let (id2, tx2, mut rx2) = conn();
+        conns.register("alice", id1, tx1);
+        conns.register("alice", id2, tx2);
+
+        conns.send_to("alice", "hello");
+        assert_eq!(drain(&mut rx1), vec!["hello"]);
+        assert_eq!(drain(&mut rx2), vec!["hello"]);
+    }
+
+    #[test]
+    fn send_to_except_skips_the_excluded_connection() {
+        let conns = WsConnections::new();
+        let (id1, tx1, mut rx1) = conn();
+        let (id2, tx2, mut rx2) = conn();
+        conns.register("alice", id1, tx1);
+        conns.register("alice", id2, tx2);
+
+        // Echo to alice's *other* devices, excluding the originating one (id1).
+        conns.send_to_except("alice", id1, "echo");
+        assert!(drain(&mut rx1).is_empty(), "originating conn must be skipped");
+        assert_eq!(drain(&mut rx2), vec!["echo"]);
+    }
+
+    #[test]
+    fn sending_to_unknown_user_is_a_noop() {
+        let conns = WsConnections::new();
+        // Neither call should panic when the user has no connections.
+        conns.send_to("ghost", "x");
+        conns.send_to_except("ghost", Uuid::new_v4(), "x");
+    }
+
+    #[test]
+    fn unregister_removes_connection_and_drops_empty_user() {
+        let conns = WsConnections::new();
+        let (id1, tx1, mut rx1) = conn();
+        let (id2, tx2, mut rx2) = conn();
+        conns.register("alice", id1, tx1);
+        conns.register("alice", id2, tx2);
+
+        // Remove one of two: the user remains, only the survivor receives.
+        conns.unregister("alice", id1);
+        conns.send_to("alice", "after-one");
+        assert!(drain(&mut rx1).is_empty());
+        assert_eq!(drain(&mut rx2), vec!["after-one"]);
+
+        // Remove the last connection: the user key is dropped entirely, so a
+        // later send reaches nobody (exercises the empty-list removal branch).
+        conns.unregister("alice", id2);
+        conns.send_to("alice", "after-all");
+        assert!(drain(&mut rx2).is_empty());
+    }
+}

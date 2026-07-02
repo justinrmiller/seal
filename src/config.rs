@@ -306,6 +306,116 @@ mod tests {
             None => std::env::remove_var("SEAL_PROJECT_ROOT"),
         }
     }
+
+    /// All process-global env vars that `Config::load` reads. Snapshotted and
+    /// restored around each load() test so they don't leak between tests.
+    const LOAD_ENV_KEYS: &[&str] = &[
+        "SEAL_PROJECT_ROOT",
+        "APP_TITLE",
+        "APP_HOST",
+        "APP_PORT",
+        "DATABASE_PATH",
+        "JWT_SECRET",
+        "AUTH_JWT_ALGORITHM",
+        "AUTH_TOKEN_EXPIRE_MINUTES",
+    ];
+
+    fn snapshot(keys: &[&str]) -> Vec<(String, Option<String>)> {
+        keys.iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect()
+    }
+
+    fn restore(saved: &[(String, Option<String>)]) {
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn default_image_size_mb_is_five() {
+        assert_eq!(default_image_size_mb(), 5);
+    }
+
+    #[test]
+    fn load_uses_embedded_defaults_with_isolated_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = snapshot(LOAD_ENV_KEYS);
+
+        // Point at an empty temp dir: no config.yaml (forces the embedded
+        // fallback) and no .env (so dotenvy can't pull in real values).
+        let root = tempfile::tempdir().expect("tempdir");
+        for k in LOAD_ENV_KEYS {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("SEAL_PROJECT_ROOT", root.path());
+
+        let cfg = Config::load().expect("load with embedded config");
+        assert_eq!(cfg.app_title, "Seal");
+        assert_eq!(cfg.app_port, 8000);
+        assert_eq!(cfg.token_expire_minutes, 1440);
+        assert_eq!(cfg.max_image_size_bytes, 5 * 1024 * 1024);
+        // JWT_SECRET unset -> the documented dev default.
+        assert_eq!(cfg.jwt_secret, "change-me");
+        // Relative database path is anchored to the project root.
+        assert_eq!(cfg.database_path, root.path().join("data/chat.lance"));
+        // No object-store options for a plain local path.
+        assert!(cfg.storage_options.is_empty());
+
+        restore(&saved);
+    }
+
+    #[test]
+    fn load_applies_env_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = snapshot(LOAD_ENV_KEYS);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        for k in LOAD_ENV_KEYS {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("SEAL_PROJECT_ROOT", root.path());
+        std::env::set_var("APP_TITLE", "Custom Title");
+        std::env::set_var("APP_PORT", "9999");
+        std::env::set_var("DATABASE_PATH", "/absolute/db.lance");
+        std::env::set_var("JWT_SECRET", "s3cr3t");
+        std::env::set_var("AUTH_JWT_ALGORITHM", "HS512");
+        std::env::set_var("AUTH_TOKEN_EXPIRE_MINUTES", "30");
+
+        let cfg = Config::load().expect("load with overrides");
+        assert_eq!(cfg.app_title, "Custom Title");
+        assert_eq!(cfg.app_port, 9999);
+        assert_eq!(cfg.jwt_secret, "s3cr3t");
+        assert_eq!(cfg.jwt_algorithm, "HS512");
+        assert_eq!(cfg.token_expire_minutes, 30);
+        // An absolute DATABASE_PATH is used verbatim, not joined to the root.
+        assert_eq!(cfg.database_path, PathBuf::from("/absolute/db.lance"));
+
+        restore(&saved);
+    }
+
+    #[test]
+    fn load_rejects_unparseable_port() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = snapshot(LOAD_ENV_KEYS);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        for k in LOAD_ENV_KEYS {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("SEAL_PROJECT_ROOT", root.path());
+        std::env::set_var("APP_PORT", "not-a-number");
+
+        assert!(
+            Config::load().is_err(),
+            "an unparseable APP_PORT should fail load()"
+        );
+
+        restore(&saved);
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
