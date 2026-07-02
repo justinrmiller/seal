@@ -142,6 +142,31 @@ full suite with `cargo test` (unit tests live in `src/`, integration tests in
 - Keep pure logic (URI/scheme detection, validation regexes, parsing) unit-tested
   in-module under `#[cfg(test)]`, separate from the HTTP-level integration tests.
 
+### What's intentionally left uncovered
+
+Coverage is measured with `cargo llvm-cov` (line coverage ~95%). A handful of
+paths are deliberately not tested — don't chase these without a reason:
+
+- **`main.rs` (the composition root).** It only wires already-tested units
+  together — `Config::load`, `db::connect`/`init_db`, `build_router` — and then
+  `axum::serve`s forever. The integration harness (`TestServer::spawn`) exercises
+  the same wiring against a controllable listener; unit-testing `main` itself would
+  bind real sockets and block, adding I/O flakiness but no new logic coverage.
+  (If you touch `main`, consider extracting the connect+`init_db`+`AppState`
+  assembly into a shared bootstrap fn so both `main` and `TestServer` call it —
+  that would fold it into coverage for free.)
+- **DB-failure error closures** — the `.map_err(|e| AppError::Internal(...))` arms
+  on LanceDB calls, and the `tracing::warn!(...)` arms in the WS handler for
+  handler errors. These only fire when the embedded database itself errors mid-
+  request; there's no fault-injection layer, so forcing them would prove little.
+  Prefer testing the *observable* error responses (400/401/403/404) over these.
+- **Unreachable embedded-asset branches** — `internal_error` in `lib.rs` fires
+  only if the compiled-in `index.html` is missing or non-UTF-8, which can't happen
+  in a valid build.
+
+If you find yourself needing to cover an error closure, that's a signal to add a
+seam (a trait or an injectable failure) rather than contort a test.
+
 ## Dependencies
 
 - `arrow-array` is **coupled to LanceDB** — it must track the Arrow major version
