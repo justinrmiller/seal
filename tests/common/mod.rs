@@ -1,17 +1,9 @@
 //! Shared test harness: spin up the seal-server router on a random port
 //! against a fresh LanceDB directory, expose a base URL for the test.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use seal_server::{
-    build_router,
-    config::Config,
-    db,
-    rate_limit::RateLimiter,
-    ws::WsConnections,
-    AppState,
-};
+use seal_server::{config::Config, serve, AppState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -32,31 +24,22 @@ impl TestServer {
         let cfg = Config::for_test(db_path, "test-secret-key-for-tests".into())
             .expect("load test config");
 
-        let conn = db::connect(&cfg.database_path, &cfg.storage_options)
+        // Reuse the same bootstrap + serve path that `main` uses in production.
+        let state = AppState::bootstrap(Arc::new(cfg))
             .await
-            .expect("db connect");
-        db::init_db(&conn).await.expect("init_db");
+            .expect("bootstrap state");
 
-        let state = AppState {
-            cfg: Arc::new(cfg),
-            conn,
-            rate_limiter: Arc::new(RateLimiter::new()),
-            ws_connections: Arc::new(WsConnections::new()),
-        };
-
-        let router = build_router(state.clone())
-            .into_make_service_with_connect_info::<SocketAddr>();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server_state = state.clone();
         let join = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async {
-                    let _ = rx.await;
-                })
-                .await
-                .unwrap();
+            serve(server_state, listener, async {
+                let _ = rx.await;
+            })
+            .await
+            .expect("serve");
         });
 
         Self {
@@ -69,9 +52,7 @@ impl TestServer {
     }
 
     pub fn client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
-            .build()
-            .expect("reqwest client")
+        reqwest::Client::builder().build().expect("reqwest client")
     }
 
     pub fn url(&self, path: &str) -> String {

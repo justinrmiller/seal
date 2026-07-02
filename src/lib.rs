@@ -9,6 +9,8 @@ pub mod routes;
 pub mod validate;
 pub mod ws;
 
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Path as AxPath, State};
@@ -17,6 +19,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use include_dir::{include_dir, Dir};
+use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
@@ -32,6 +35,49 @@ pub struct AppState {
     pub conn: lancedb::connection::Connection,
     pub rate_limiter: Arc<RateLimiter>,
     pub ws_connections: Arc<WsConnections>,
+}
+
+impl AppState {
+    /// Open the configured database, run migrations, and assemble the shared
+    /// application state. Shared by `main` (via [`run`]) and the integration
+    /// test harness so the startup path is exercised by every test.
+    pub async fn bootstrap(cfg: Arc<Config>) -> anyhow::Result<Self> {
+        let conn = db::connect(&cfg.database_path, &cfg.storage_options).await?;
+        db::init_db(&conn).await?;
+        Ok(Self {
+            cfg,
+            conn,
+            rate_limiter: Arc::new(RateLimiter::new()),
+            ws_connections: Arc::new(WsConnections::new()),
+        })
+    }
+}
+
+/// Serve the application on `listener` until `shutdown` resolves.
+pub async fn serve(
+    state: AppState,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let app = build_router(state).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
+/// Full server entrypoint: bootstrap state, bind the configured address, and
+/// serve until Ctrl-C. Lives here rather than in `main` so its building blocks
+/// ([`AppState::bootstrap`] and [`serve`]) are covered by tests.
+pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
+    let state = AppState::bootstrap(cfg.clone()).await?;
+    let addr: SocketAddr = format!("{}:{}", cfg.app_host, cfg.app_port).parse()?;
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("listening on http://{}", listener.local_addr()?);
+    serve(state, listener, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -120,4 +166,60 @@ fn internal_error(msg: &'static str) -> Response {
         msg,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_state() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = Config::for_test(dir.path().join("t.lance"), "lib-test-secret".into())
+            .expect("test config");
+        let state = AppState::bootstrap(Arc::new(cfg))
+            .await
+            .expect("bootstrap");
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_opens_db_and_creates_all_tables() {
+        let (state, _dir) = test_state().await;
+        let names: std::collections::HashSet<String> = state
+            .conn
+            .table_names()
+            .execute()
+            .await
+            .expect("table_names")
+            .into_iter()
+            .collect();
+        for table in ["users", "messages", "channels", "channel_members", "attachments"] {
+            assert!(names.contains(table), "bootstrap should create {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_responds_then_shuts_down_gracefully() {
+        let (state, _dir) = test_state().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(serve(state, listener, async {
+            let _ = rx.await;
+        }));
+
+        // The server is up and routes requests (exercises build_router + index).
+        let res = reqwest::get(format!("http://{addr}/"))
+            .await
+            .expect("request");
+        assert_eq!(res.status(), 200);
+
+        // Signalling shutdown lets the server future resolve cleanly.
+        let _ = tx.send(());
+        handle
+            .await
+            .expect("join")
+            .expect("serve returns Ok on graceful shutdown");
+    }
 }
