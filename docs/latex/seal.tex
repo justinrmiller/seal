@@ -6,6 +6,11 @@
 \usepackage{lmodern}
 \usepackage{microtype}
 
+% Give TeX room to break lines before long unbreakable \verb tokens rather
+% than oversetting them into (or past) the right margin.
+\setlength{\emergencystretch}{3em}
+\tolerance=1200
+
 % --- Layout -----------------------------------------------------------------
 \usepackage[a4paper,margin=1in]{geometry}
 \usepackage{fancyhdr}
