@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.app_port
     );
 
-    let conn = db::connect(&cfg.database_path).await?;
+    let conn = db::connect(&cfg.database_path, &cfg.storage_options).await?;
     db::init_db(&conn).await?;
 
     let state = AppState {

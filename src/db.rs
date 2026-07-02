@@ -55,14 +55,26 @@ pub fn channel_members_schema() -> SchemaRef {
     ]))
 }
 
-pub async fn connect(path: &std::path::Path) -> anyhow::Result<Connection> {
-    if let Some(parent) = path.parent() {
+pub async fn connect(
+    location: &std::path::Path,
+    storage_options: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Connection> {
+    let path_str = location
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", location.display()))?;
+
+    if crate::config::is_object_store_uri(path_str) {
+        // Object storage: hand the URI to LanceDB and let object_store manage it.
+        // No local directory to create.
+    } else if let Some(parent) = location.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", path.display()))?;
-    let conn = lancedb::connect(path_str).execute().await?;
+
+    let mut builder = lancedb::connect(path_str);
+    if !storage_options.is_empty() {
+        builder = builder.storage_options(storage_options.clone());
+    }
+    let conn = builder.execute().await?;
     Ok(conn)
 }
 

@@ -26,7 +26,7 @@ async fn migrates_messages_table_with_legacy_schema() -> anyhow::Result<()> {
     let db_path = dir.path().join("legacy.lance");
 
     // Step 1: write a messages table with the OLD schema and one row.
-    let conn = seal_server::db::connect(&db_path).await?;
+    let conn = seal_server::db::connect(&db_path, &Default::default()).await?;
     let legacy_schema = legacy_messages_schema();
     let row = RecordBatch::try_new(
         legacy_schema.clone(),
@@ -111,7 +111,7 @@ async fn migrates_messages_table_with_legacy_schema() -> anyhow::Result<()> {
 async fn init_db_is_noop_on_current_schema() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("fresh.lance");
-    let conn = seal_server::db::connect(&db_path).await?;
+    let conn = seal_server::db::connect(&db_path, &Default::default()).await?;
     seal_server::db::init_db(&conn).await?;
     // Second call must be a clean noop.
     seal_server::db::init_db(&conn).await?;

@@ -32,7 +32,9 @@ impl TestServer {
         let cfg = Config::for_test(db_path, "test-secret-key-for-tests".into())
             .expect("load test config");
 
-        let conn = db::connect(&cfg.database_path).await.expect("db connect");
+        let conn = db::connect(&cfg.database_path, &cfg.storage_options)
+            .await
+            .expect("db connect");
         db::init_db(&conn).await.expect("init_db");
 
         let state = AppState {
