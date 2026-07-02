@@ -287,6 +287,23 @@ async fn invite_member_succeeds() {
 }
 
 #[tokio::test]
+async fn invite_nonexistent_user_returns_404() {
+    let s = TestServer::spawn().await;
+    let alice = register(&s, "alice").await;
+    let ch = create_channel(&s, &alice, "invite-ghost", &[]).await;
+    let ch_id = ch["id"].as_str().unwrap();
+    // alice is a member, so authz passes; the target user simply doesn't exist.
+    let res = s
+        .client()
+        .post(s.url(&format!("/api/channels/{ch_id}/members?token={alice}")))
+        .json(&json!({"username": "ghost"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+#[tokio::test]
 async fn invite_by_non_member_returns_403() {
     let s = TestServer::spawn().await;
     let alice = register(&s, "alice").await;

@@ -165,6 +165,26 @@ async fn search_invalid_query_returns_400() {
 }
 
 #[tokio::test]
+async fn search_empty_query_returns_400() {
+    let s = TestServer::spawn().await;
+    let alice = register(&s, "alice", "k1").await;
+    // Empty `q` hits the explicit "q is required" guard (distinct from the
+    // regex-based invalid-character rejection above).
+    let res = s
+        .client()
+        .get(s.url(&format!("/api/users/search?q=&token={alice}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("required"),
+        "unexpected body: {body}"
+    );
+}
+
+#[tokio::test]
 async fn public_key_lookup_succeeds() {
     let s = TestServer::spawn().await;
     register(&s, "alice", "YWxpY2VrZXk=").await;
