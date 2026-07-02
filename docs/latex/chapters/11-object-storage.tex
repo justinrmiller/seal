@@ -1,0 +1,137 @@
+\chapter{Object Storage (Feature Branch)}
+\label{chap:object-storage}
+
+\begin{quote}
+\textbf{Scope.} Everything in this chapter describes the
+\verb|feat/object-storage| branch. It is \emph{not} merged into \verb|main|; the
+\verb|main| database connector documented in Chapter~\ref{chap:database} is
+filesystem-only. This chapter is included so the reference is complete, and each
+feature-branch-only element is called out as such.
+\end{quote}
+
+\section{Motivation}
+
+LanceDB can persist to cloud object storage (S3, GCS, Azure Blob) as easily as to
+a local directory --- the on-disk Lance format is the same, only the
+\verb|object_store| backend differs. Persisting to a bucket solves the
+durability problem that bites container platforms with ephemeral filesystems
+(\S\ref{chap:build}): the data outlives any individual instance, and multiple
+instances can point at the same location.
+
+\section{URI Detection}
+
+The feature adds scheme detection so the connector can tell a bucket URI from a
+filesystem path:
+
+\begin{lstlisting}
+const OBJECT_STORE_SCHEMES: &[&str] = &[
+    "s3://", "s3a://", "gs://", "gcs://",
+    "az://", "azure://", "abfs://", "abfss://",
+];
+pub fn is_object_store_uri(location: &str) -> bool {
+    OBJECT_STORE_SCHEMES.iter().any(|s| location.starts_with(s))
+}
+\end{lstlisting}
+
+\section{The Extended Connector}
+
+\verb|connect| gains a \verb|storage_options| argument and two behavioural
+changes versus the \verb|main| version:
+
+\begin{lstlisting}
+pub async fn connect(
+    location: &std::path::Path,
+    storage_options: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Connection> {
+    // Only create local directories for filesystem paths.
+    if !is_object_store_uri(path_str) {
+        if let Some(parent) = location.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    let mut builder = lancedb::connect(path_str);
+    if !storage_options.is_empty() {
+        builder = builder.storage_options(storage_options.clone());
+    }
+    builder.execute().await
+}
+\end{lstlisting}
+
+Two things change relative to \verb|main|: object-store URIs are passed to
+LanceDB verbatim (no \verb|create_dir_all|, no path joining), and
+credential/endpoint options are threaded through
+\verb|builder.storage_options(...)|. Everything above the connector --- schemas,
+\verb|init_db|, the migration, every route --- is byte-for-byte identical. The
+encryption model and data layout do not change; only where the bytes land does.
+
+\section{Configuration}
+
+On the feature branch, \verb|config.yaml| grows an optional free-form
+\verb|storage| section whose key/value pairs become the LanceDB storage options,
+and the database path becomes a URI:
+
+\begin{lstlisting}
+database:
+  path: "s3://my-bucket/chat.lance"      # or gs://, az://, abfs://
+
+storage:
+  aws_endpoint: "http://localhost:4566"  # LocalStack / MinIO / moto
+  region: "us-east-1"
+  allow_http: "true"
+  aws_access_key_id: "test"
+  aws_secret_access_key: "test"
+\end{lstlisting}
+
+Standard AWS environment variables (\verb|AWS_ACCESS_KEY_ID|,
+\verb|AWS_SECRET_ACCESS_KEY|, \verb|AWS_REGION|, \verb|AWS_ENDPOINT|,
+\verb|AWS_ALLOW_HTTP|) are also honoured, so no secrets need be written to disk in
+production.
+
+\section{The Smoke Test}
+
+The branch adds \verb|tests/object_storage.rs|, a single
+\verb|#[tokio::test] #[ignore]| case --- ignored by default because normal CI has
+no object store. It connects to an S3-compatible endpoint, runs \verb|init_db|,
+verifies all five tables are created in the bucket, and writes then reads a row
+to prove a full round-trip. It reads its target from environment variables:
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Variable} & \textbf{Example} \\
+\midrule
+\verb|SEAL_TEST_S3_URI| & \verb|s3://seal/it.lance| \\
+\verb|SEAL_TEST_S3_ENDPOINT| & \verb|http://localhost:5001| \\
+\verb|SEAL_TEST_S3_REGION| & \verb|us-east-1| \\
+\verb|AWS_ACCESS_KEY_ID| & \verb|test| \\
+\verb|AWS_SECRET_ACCESS_KEY| & \verb|test| \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{Running it against \texttt{moto} (Docker-free)}
+
+\begin{lstlisting}
+# A pure-Python S3 mock -- no Docker required.
+uv venv /tmp/motoenv
+uv pip install --python /tmp/motoenv/bin/python "moto[server]"
+/tmp/motoenv/bin/moto_server -p 5001 &
+
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \
+  aws --endpoint-url http://localhost:5001 s3 mb s3://seal
+
+SEAL_TEST_S3_URI=s3://seal/it.lance \
+SEAL_TEST_S3_ENDPOINT=http://localhost:5001 \
+  cargo test --test object_storage -- --ignored --nocapture
+\end{lstlisting}
+
+The same test works against LocalStack, MinIO, or real S3 by pointing the
+endpoint and credentials elsewhere.
+
+\section{A Note on Cargo Features}
+
+Talking to cloud stores requires LanceDB's object-store backends to be compiled
+in. When merging this feature, confirm the \verb|lancedb| dependency in
+\verb|Cargo.toml| enables the needed backends (e.g. \verb|aws|, \verb|gcs|,
+\verb|azure|); on \verb|main| the dependency is declared without those features
+because the connector never reaches for them.

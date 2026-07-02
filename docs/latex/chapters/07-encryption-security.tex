@@ -1,0 +1,179 @@
+\chapter{Encryption and the Security Model}
+\label{chap:security}
+
+Seal's security rests on a simple division of labour: \textbf{the client does the
+cryptography; the server does the bookkeeping}. This chapter covers both --- the
+end-to-end encryption scheme and the server-side defences (authentication,
+authorization, rate limiting, input validation, and error hygiene).
+
+\section{End-to-End Encryption}
+
+\subsection*{Keys}
+Each user has an X25519 key pair generated on the client with libsodium. The
+public half is uploaded at registration (\verb|public_key_jwk|) and served to
+peers via \verb|GET /api/users/{target}/public_key| and, for groups,
+\verb|GET /api/channels/{id}/members/public_keys|. The private half never leaves
+the device.
+
+\subsection*{Encrypting a message}
+To message a peer, the client fetches the peer's public key and seals the
+plaintext with libsodium (a \verb|crypto_box|-style operation: X25519 key
+agreement plus an authenticated stream cipher). The wire carries only the
+\verb|ciphertext|, the \verb|iv|/nonce, and an ephemeral
+\verb|sender_public_key_jwk|. The server stores these opaque strings verbatim.
+
+\subsection*{DMs: encrypt twice}
+Because a message sealed to Bob's key is unreadable by Alice, the sender encrypts
+a \emph{second} copy to her own key. The server stores the recipient copy
+(\verb|channel_id = ''|) and the self copy (\verb|channel_id = 'self'|), as
+detailed in Chapter~\ref{chap:websocket}. History reconstruction merges the two.
+
+\subsection*{Channels: encrypt per member (fan-out)}
+There is no shared group key. To post to a channel the client encrypts one
+\emph{envelope} per member, each sealed to that member's public key, and submits
+them together. The server stores one row per envelope and delivers each member
+their own ciphertext. A channel of $n$ members yields $n$ stored ciphertexts per
+message.
+
+\subsection*{What the server can and cannot see}
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Visible to the server} & \textbf{Never visible} \\
+\midrule
+Usernames and public keys & Private keys \\
+Who messaged whom, and when & Message plaintext \\
+Channel membership & Image contents \\
+Ciphertext, IVs, sizes & Anything decryptable \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A full database compromise therefore leaks the social graph and ciphertext, but
+not message contents. Seal does not claim to hide metadata --- only content.
+
+\section{Passwords: bcrypt}
+
+\verb|src/auth.rs| hashes passwords with bcrypt at the library's
+\verb|DEFAULT_COST|:
+
+\begin{lstlisting}
+pub fn hash_password(plain: &str) -> Result<String, AppError> {
+    bcrypt::hash(plain, DEFAULT_COST)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("bcrypt hash failed: {e}")))
+}
+pub fn verify_password(plain: &str, hashed: &str) -> bool {
+    bcrypt::verify(plain, hashed).unwrap_or(false)
+}
+\end{lstlisting}
+
+\verb|verify_password| returns \verb|false| on \emph{any} error, including a
+malformed stored hash --- it never panics and never treats an unparseable hash as
+a match. The \verb|$2b$| bcrypt format is wire-compatible with the Python
+predecessor, so hashes created by the old server still verify.
+
+\section{Sessions: JSON Web Tokens}
+
+Tokens are HMAC-signed JWTs. \verb|create_token| stamps a \verb|sub| (username)
+and an \verb|exp| computed from \verb|token_expire_minutes| (clamped at zero so a
+negative config cannot backdate). \verb|algorithm_from| accepts only
+\verb|HS256|, \verb|HS384|, and \verb|HS512|; anything else is an internal error.
+
+Verification is deliberately forgiving in \emph{form} but strict in
+\emph{outcome}:
+
+\begin{lstlisting}
+pub fn require_auth(cfg: &Config, token: &str) -> Result<String, AppError> {
+    decode_token(cfg, token).ok_or(AppError::Unauthorized("Invalid token"))
+}
+pub fn decode_token(cfg: &Config, token: &str) -> Option<String> {
+    let validation = Validation::new(algorithm_from(cfg).ok()?);
+    decode::<Claims>(token, &DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+                     &validation).ok().map(|d| d.claims.sub)
+}
+\end{lstlisting}
+
+Any failure --- wrong secret, garbage input, or an expired token (the default
+60-second leeway aside) --- collapses to \verb|None| and thus a single
+\verb|401 "Invalid token"|. The unit tests cover round-trips for all three
+algorithms, wrong-secret rejection, garbage input, and expiry.
+
+\section{Rate Limiting}
+
+\verb|src/rate_limit.rs| implements an in-memory sliding window, keyed by the
+direct peer IP:
+
+\begin{lstlisting}
+const RATE_LIMIT_WINDOW_SECS: f64 = 60.0;
+const RATE_LIMIT_MAX: usize = 20;
+\end{lstlisting}
+
+\verb|check(ip)| prunes timestamps older than 60 seconds, rejects with
+\verb|AppError::TooManyRequests| (\verb|429|) if 20 are already in the window, and
+otherwise records \verb|now|. It is applied to the abuse-prone endpoints:
+\verb|/api/register|, \verb|/api/login|, and \verb|/api/users/search|.
+
+Two caveats worth knowing when operating Seal:
+
+\begin{itemize}
+  \item The limiter keys on the socket peer IP (via
+        \verb|ConnectInfo<SocketAddr>|). Behind a reverse proxy, that is the
+        proxy's IP unless the proxy is configured to preserve the client
+        address; the limiter does not read \verb|X-Forwarded-For|.
+  \item State is per-process and in-memory: it resets on restart and is not
+        shared across horizontally-scaled instances.
+\end{itemize}
+
+\section{Input Validation}
+
+\verb|src/validate.rs| holds the guards, all backed by the regexes compiled in
+\verb|Config|:
+
+\begin{itemize}
+  \item \verb|validate_username| --- must match
+        \verb|^[A-Za-z0-9_-]{1,64}$| (length from config). Error message:
+        ``Username must be 1-64 alphanumeric characters, hyphens, or
+        underscores''.
+  \item \verb|validate_id| --- same charset, up to the configured id length
+        (128). Used for channel and attachment ids.
+  \item \verb|validate_after| --- rejects NaN, infinity, and negatives so the
+        polling cursor cannot smuggle a malformed float into a query.
+\end{itemize}
+
+These guards are the linchpin of query safety (\S\ref{chap:database}): because
+every identifier interpolated into a LanceDB predicate has first passed a
+guard restricting it to \verb|[A-Za-z0-9_-]|, no quote or metacharacter can reach
+the query string. \emph{Validate before you interpolate} is the rule any new
+handler must follow.
+
+\section{Authorization}
+
+Beyond authentication, handlers enforce resource-level rules in application code:
+
+\begin{itemize}
+  \item Channel reads and membership changes require the caller to be a member
+        (\verb|is_channel_member| / \verb|assert_channel_member| $\to$
+        \verb|403 "Not a member of this channel"|).
+  \item Attachment reads require channel membership when the attachment belongs
+        to a channel.
+  \item DM history is scoped to the caller by construction of the query
+        predicates.
+\end{itemize}
+
+\section{Error Hygiene}
+
+\verb|src/error.rs| defines \verb|AppError| and its \verb|IntoResponse|. Client
+errors pass their message through; the \verb|Internal| variant is different:
+
+\begin{lstlisting}
+AppError::Internal(e) => {
+    tracing::error!("internal error: {e:?}");   // full detail to the log
+    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+}
+\end{lstlisting}
+
+The underlying \verb|anyhow| chain --- which may mention database paths or
+internal state --- is logged but \emph{never} returned to the client, which sees
+only a generic 500. A dedicated test asserts that a secret in the error does not
+leak into the body. The \verb|#[from] anyhow::Error| on \verb|Internal| lets any
+\verb|?| in a handler funnel unexpected failures into this masked path.

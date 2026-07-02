@@ -1,0 +1,110 @@
+\chapter{Testing}
+\label{chap:testing}
+
+Seal is tested at two levels: \textbf{unit tests} co-located in \verb|src/|
+modules, and \textbf{integration tests} in \verb|tests/| that drive the real
+server over HTTP and WebSocket. At the time of writing the \verb|tests/| tree
+holds 72 \verb|#[tokio::test]| integration cases, plus unit-test modules in seven
+source files (\verb|auth|, \verb|config|, \verb|db_ops|, \verb|error|,
+\verb|rate_limit|, \verb|validate|, \verb|ws|).
+
+\begin{quote}
+\textbf{Doc drift note.} The \verb|README| still advertises ``62 native Rust
+integration tests''; the actual count has since grown. Treat the source tree, not
+the prose, as authoritative.
+\end{quote}
+
+\section{The Integration Harness}
+
+\verb|tests/common/mod.rs| defines \verb|TestServer|, which spins up the genuine
+application stack against a throwaway database:
+
+\begin{lstlisting}
+let tempdir = tempfile::tempdir()?;                 // isolated, auto-cleaned
+let db_path = tempdir.path().join("test.lance");
+let cfg = Config::for_test(db_path, "test-secret-key-for-tests".into())?;
+let conn = db::connect(&cfg.database_path).await?;
+db::init_db(&conn).await?;
+let state = AppState { cfg: Arc::new(cfg), conn,
+                       rate_limiter: ..., ws_connections: ... };
+let router = build_router(state.clone())
+    .into_make_service_with_connect_info::<SocketAddr>();
+let listener = TcpListener::bind("127.0.0.1:0").await?;  // random free port
+\end{lstlisting}
+
+The server runs in a spawned task with graceful shutdown wired to a
+\verb|oneshot| channel held in the struct; when the \verb|TestServer| drops, the
+server stops and the \verb|TempDir| is deleted. Two properties make the suite
+robust and fast:
+
+\begin{itemize}
+  \item \textbf{Real router, real DB.} Tests exercise \verb|build_router| and
+        LanceDB exactly as production does --- no mocks, no in-memory
+        substitutes. Only the config source (\verb|for_test|) and the storage
+        location (a temp dir) differ.
+  \item \textbf{Parallel-safe.} Each test gets its own port, its own database,
+        and a config that ignores process env vars, so the default parallel test
+        runner has nothing to race on.
+\end{itemize}
+
+\verb|TestServer| also exposes \verb|base_url|, a \verb|client()| builder
+(\verb|reqwest|), the \verb|state| (so a test can seed rows directly through
+\verb|db_ops|), and a \verb|url(path)| helper.
+
+\section{The Testing Philosophy: Seed via Internals, Assert via API}
+
+The suite's guiding pattern is to \emph{set up} state through the library
+internals (writing rows with \verb|db_ops::append|, minting tokens with
+\verb|create_token|) and then to \emph{exercise and assert} through the public
+HTTP/WS surface. This keeps tests fast and precise while still covering the real
+request path. Each test file keeps its own small local helpers (\verb|register|,
+\verb|create_channel|, \verb|open_ws|, \dots) rather than a shared ``kitchen
+sink'', so a test reads top-to-bottom.
+
+\section{What the Integration Files Cover}
+
+\begin{center}
+\begin{longtable}{@{}lp{0.60\textwidth}@{}}
+\toprule
+\textbf{File} & \textbf{Focus} \\
+\midrule
+\endhead
+\verb|tests/auth.rs| & Registration, login, duplicate-user and bad-credential paths, JWT acceptance/rejection, bcrypt compatibility, and rate limiting. \\
+\verb|tests/users.rs| & DM-contact derivation, prefix search (self-exclusion, the 20 cap), and public-key retrieval. \\
+\verb|tests/channels.rs| & Channel create/list/browse/join, member invite, membership authorization, duplicate-name and duplicate-member rejection, and member-key listing. \\
+\verb|tests/messages.rs| & DM history merging and \verb|after| filtering, channel history scoping, the REST channel-send path, and attachments. \\
+\verb|tests/websocket.rs| & Upgrade and token gating, DM relay (including self-copy and multi-device echo), channel fan-out, and non-member rejection. \\
+\verb|tests/migration.rs| & The messages-table column migration and its idempotency on re-run. \\
+\verb|tests/static_assets.rs| & Serving the embedded \verb|index.html| and static assets with correct content types. \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{Unit Tests}
+
+The co-located \verb|#[cfg(test)]| modules test pure logic in isolation:
+\verb|config| (the cascade and env precedence), \verb|auth| (hashing, tokens,
+expiry), \verb|db_ops| (row builders, null/missing/wrong-type handling, the
+message materializer), \verb|error| (status/body mapping and internal masking),
+\verb|rate_limit| (boundary, per-IP, reset), \verb|validate| (accepted/rejected
+inputs), and \verb|ws| (registry fan-out and cleanup).
+
+\section{Running the Tests}
+
+\begin{lstlisting}
+make test          # cargo test  -- everything
+make test-quiet    # cargo test --quiet
+cargo test --test websocket        # one integration file
+cargo test config::                # a module's unit tests
+\end{lstlisting}
+
+\section{Coverage and Intentionally-Untested Paths}
+
+Line coverage is measured with \verb|cargo llvm-cov| (see the coverage CI
+workflow in Chapter~\ref{chap:build}). A few paths are deliberately left
+uncovered because exercising them would add machinery out of proportion to their
+risk: \verb|src/main.rs| (the thin bootstrap, covered in spirit by the harness),
+the database-failure error closures inside \verb|db_ops| (they require injecting a
+broken connection), and some embedded-asset ``file missing / not UTF-8'' branches
+in \verb|lib.rs| that cannot occur with the assets that are actually compiled in.
+These omissions are documented rather than papered over.

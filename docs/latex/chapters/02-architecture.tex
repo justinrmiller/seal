@@ -1,0 +1,163 @@
+\chapter{Architecture}
+\label{chap:architecture}
+
+\section{The Three-Layer Model}
+
+Seal is best understood as three layers with a strict trust boundary between the
+first two:
+
+\begin{enumerate}
+  \item \textbf{Client layer} (browser or Tauri desktop). Generates the user's
+        X25519 key pair, stores the private key locally (e.g. IndexedDB), and
+        performs \emph{all} encryption and decryption with libsodium. It speaks
+        to the server over HTTP (REST) and a WebSocket.
+  \item \textbf{Server layer} (\verb|seal-server|, this codebase). A stateless
+        relay: it authenticates requests, validates and authorizes them, stores
+        ciphertext, and fans messages out to connected recipients. It never has
+        the keys to read message bodies.
+  \item \textbf{Storage layer} (LanceDB). Five Arrow-backed tables persisted to
+        the local filesystem (on \verb|main|) or to cloud object storage (on the
+        \verb|feat/object-storage| branch).
+\end{enumerate}
+
+\begin{lstlisting}
+        Client (libsodium)            Server (seal-server)          Storage
+   +------------------------+     +------------------------+   +----------------+
+   |  keypair gen           |     |  auth  (JWT, bcrypt)   |   |  LanceDB       |
+   |  encrypt / decrypt     |<===>|  validate + authorize  |<=>|  users         |
+   |  IndexedDB (priv key)  | WS  |  rate limit            |   |  messages      |
+   |  REST + WebSocket      |HTTP |  store ciphertext       |   |  channels      |
+   +------------------------+     |  relay via WsConnections|   |  channel_members|
+                                  +------------------------+   |  attachments   |
+                                                               +----------------+
+        <----------- ciphertext only crosses this boundary ----------->
+\end{lstlisting}
+
+\section{The Crate Layout}
+
+The project is a single Cargo crate that produces one binary. The split between
+\verb|src/main.rs| and \verb|src/lib.rs| exists so tests can link against the
+library and construct the same router the binary runs.
+
+\begin{center}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.62\textwidth}@{}}
+\toprule
+\textbf{File} & \textbf{Responsibility} \\
+\midrule
+\endhead
+\verb|src/main.rs| & Binary entry point: init tracing, load config, connect and initialize the DB, build \verb|AppState|, bind the listener, serve. \\
+\verb|src/lib.rs| & Library root: declares modules, defines \verb|AppState| and \verb|build_router|, serves the embedded \verb|index.html| and static assets. \\
+\verb|src/config.rs| & Layered configuration (embedded YAML $\to$ disk YAML $\to$ env vars); compiles validation regexes. \\
+\verb|src/db.rs| & Arrow schemas for the five tables; \verb|connect| and \verb|init_db|; the messages-table migration. \\
+\verb|src/db_ops.rs| & Thin helpers over LanceDB tables: scans, appends, row builders, and column extractors. \\
+\verb|src/models.rs| & Serde request/response structs. \\
+\verb|src/auth.rs| & bcrypt hashing and JWT create/verify. \\
+\verb|src/validate.rs| & Username / ID / timestamp guards. \\
+\verb|src/rate_limit.rs| & In-memory, per-IP sliding-window limiter. \\
+\verb|src/error.rs| & \verb|AppError| enum and its mapping to HTTP responses. \\
+\verb|src/ws.rs| & The \verb|WsConnections| registry (who is connected, and how to reach them). \\
+\verb|src/routes/*.rs| & One module per resource group: auth, users, channels, messages, attachments, and the WebSocket handler. \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{\texttt{AppState}: The Shared Handle}
+
+Every handler receives a cloned \verb|AppState| via Axum's \verb|State| extractor.
+It is cheap to clone --- everything inside is either an \verb|Arc| or a LanceDB
+\verb|Connection| (itself internally reference-counted). It is defined in
+\verb|src/lib.rs|:
+
+\begin{lstlisting}
+#[derive(Clone)]
+pub struct AppState {
+    pub cfg: Arc<Config>,
+    pub conn: lancedb::connection::Connection,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub ws_connections: Arc<WsConnections>,
+}
+\end{lstlisting}
+
+\begin{itemize}
+  \item \verb|cfg| --- the immutable, fully-resolved configuration.
+  \item \verb|conn| --- the single shared LanceDB connection; tables are opened
+        on demand through \verb|db_ops::open|.
+  \item \verb|rate_limiter| --- the shared abuse limiter (see
+        \S\ref{chap:security}).
+  \item \verb|ws_connections| --- the live WebSocket registry used to relay
+        messages to connected recipients.
+\end{itemize}
+
+\section{The Router}
+
+\verb|build_router| in \verb|src/lib.rs| wires every path to its handler,
+attaches a \verb|TraceLayer| for request logging, and injects the state. The
+complete route table:
+
+\begin{center}
+\begin{longtable}{@{}llp{0.42\textwidth}@{}}
+\toprule
+\textbf{Method} & \textbf{Path} & \textbf{Handler} \\
+\midrule
+\endhead
+GET & \verb|/| & embedded \verb|index.html| \\
+POST & \verb|/api/register| & \verb|routes::auth::register| \\
+POST & \verb|/api/login| & \verb|routes::auth::login| \\
+GET & \verb|/api/users| & \verb|routes::users::list_users| \\
+GET & \verb|/api/users/search| & \verb|routes::users::search_users| \\
+GET & \verb|/api/users/{target}/public_key| & \verb|routes::users::get_public_key| \\
+GET/POST & \verb|/api/channels| & \verb|list_channels| / \verb|create_channel| \\
+GET & \verb|/api/channels/browse| & \verb|routes::channels::browse_channels| \\
+GET & \verb|/api/channels/{id}| & \verb|routes::channels::get_channel| \\
+POST & \verb|/api/channels/{id}/join| & \verb|routes::channels::join_channel| \\
+POST & \verb|/api/channels/{id}/members| & \verb|routes::channels::add_channel_member| \\
+GET & \verb|/api/channels/{id}/members/public_keys| & \verb|get_channel_member_keys| \\
+GET & \verb|/api/messages/{peer}| & \verb|routes::messages::get_dm_messages| \\
+GET/POST & \verb|/api/channels/{id}/messages| & \verb|get_channel_messages| / \verb|post_channel_message| \\
+GET & \verb|/api/attachments/{id}| & \verb|routes::attachments::get_attachment| \\
+GET & \verb|/ws/chat| & \verb|routes::ws::ws_chat| \\
+GET & \verb|/static/{*path}| & embedded static assets \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\section{Lifecycle of a Request}
+
+The bootstrap sequence in \verb|src/main.rs| is deliberately linear:
+
+\begin{lstlisting}
+let cfg = Arc::new(Config::load()?);        // 1. resolve configuration
+let conn = db::connect(&cfg.database_path).await?;  // 2. open LanceDB
+db::init_db(&conn).await?;                   // 3. create/migrate tables
+let state = AppState { cfg, conn, rate_limiter, ws_connections };
+let app = build_router(state);               // 4. wire routes
+let listener = TcpListener::bind(addr).await?;
+axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+\end{lstlisting}
+
+Note \verb|into_make_service_with_connect_info::<SocketAddr>()|: it exposes the
+peer socket address to handlers, which the rate limiter needs to key on the
+client IP.
+
+A typical authenticated REST request then flows:
+
+\begin{enumerate}
+  \item Axum extracts \verb|State<AppState>|, path/query params, and (for writes)
+        a JSON body.
+  \item The handler optionally calls \verb|rate_limiter.check(ip)| (auth and
+        search endpoints).
+  \item It authenticates by calling \verb|require_auth(&cfg, &token)|, turning
+        the query-string token into a username or a 401.
+  \item It validates inputs (\verb|validate_username|, \verb|validate_id|,
+        \verb|validate_after|).
+  \item It authorizes (e.g. channel-membership checks).
+  \item It reads/writes LanceDB through \verb|db_ops| helpers.
+  \item It returns \verb|Json<T>| on success or an \verb|AppError| that
+        \verb|IntoResponse| renders as \verb|{"detail": "..."}| with the right
+        status.
+\end{enumerate}
+
+The WebSocket path (\verb|/ws/chat|) is different: it upgrades the connection,
+registers it in \verb|WsConnections|, and then loops on inbound frames, storing
+each message and relaying it to connected recipients. That flow is the subject of
+Chapter~\ref{chap:websocket}.

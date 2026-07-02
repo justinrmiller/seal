@@ -1,0 +1,133 @@
+\chapter{Building, Running, and Deploying}
+\label{chap:build}
+
+\section{Dependencies at a Glance}
+
+From \verb|Cargo.toml| (the binary is \verb|seal-server|, Rust edition 2021):
+
+\begin{center}
+\begin{longtable}{@{}llp{0.42\textwidth}@{}}
+\toprule
+\textbf{Crate} & \textbf{Version} & \textbf{Role} \\
+\midrule
+\endhead
+\verb|axum| & 0.8 & Web framework (features \verb|ws|, \verb|macros|). \\
+\verb|tokio| & 1 & Async runtime (\verb|full|). \\
+\verb|tower| / \verb|tower-http| & 0.5 / 0.6 & Middleware; \verb|fs| + \verb|trace|. \\
+\verb|serde| / \verb|serde_json| / \verb|serde_yml| & 1 / 1 / 0.0.13 & Serialization (JSON, YAML). \\
+\verb|dotenvy| & 0.15 & \verb|.env| loading. \\
+\verb|bcrypt| & 0.19 & Password hashing. \\
+\verb|jsonwebtoken| & 10 & JWTs (\verb|rust_crypto|). \\
+\verb|lancedb| & 0.30 & Embedded database. \\
+\verb|arrow-array| & 58 & Arrow arrays (version-locked to \verb|lancedb|). \\
+\verb|uuid| & 1 & Ids (\verb|v4|). \\
+\verb|regex| & 1 & Validation patterns. \\
+\verb|tracing| / \verb|tracing-subscriber| & 0.1 / 0.3 & Logging. \\
+\verb|thiserror| / \verb|anyhow| & 2 / 1 & Errors. \\
+\verb|include_dir| & 0.7 & Asset bundling. \\
+\verb|mime_guess| & 2 & Static-asset content types. \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+Dev-dependencies power the integration suite: \verb|reqwest| (HTTP client, rustls),
+\verb|tokio-tungstenite| (WebSocket client), and \verb|tempfile| (throwaway
+databases).
+
+\begin{quote}
+\textbf{Arrow / LanceDB coupling.} \verb|arrow-array| is pinned to the major
+version LanceDB expects (58 for \verb|lancedb| 0.30). Bumping one usually means
+bumping the other in lock-step; a mismatch produces confusing trait-resolution
+errors at the Arrow boundary.
+\end{quote}
+
+\section{The Makefile}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Target} & \textbf{Action} \\
+\midrule
+\verb|make dev| / \verb|make build| & \verb|cargo build| (debug). \\
+\verb|make release| & \verb|cargo build --release|. \\
+\verb|make server| & \verb|cargo run|. \\
+\verb|make test| / \verb|make test-quiet| & Run the test suite. \\
+\verb|make bots| & Run the Python bot simulation against a live server. \\
+\verb|make clean| & \verb|cargo clean| + remove Tauri and \verb|__pycache__|. \\
+\verb|make reset-db| & Delete \verb|data/chat.lance|. \\
+\verb|make bundle-sodium| & Rebuild the vendored libsodium bundle. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Running Locally}
+
+\begin{lstlisting}
+make dev && make server         # http://localhost:8000
+# or, self-contained:
+cargo run --release
+\end{lstlisting}
+
+The release binary at \verb|target/release/seal-server| is self-contained ---
+templates, static assets, and the default config are compiled in. To deploy it,
+copy the binary, set \verb|JWT_SECRET| and \verb|DATABASE_PATH|, and run.
+
+\section{Docker}
+
+The \verb|Dockerfile| is a two-stage build:
+
+\begin{enumerate}
+  \item \textbf{Builder} (\verb|rust:1-bookworm|). Installs the native toolchain
+        LanceDB needs --- \verb|protobuf-compiler|, \verb|libprotobuf-dev|,
+        \verb|cmake|, \verb|pkg-config|, \verb|libssl-dev| --- and sets
+        \verb|PROTOC| / \verb|PROTOC_INCLUDE| because \verb|lance-encoding|'s
+        build script invokes \verb|protoc| and imports the well-known
+        \verb|google/protobuf/empty.proto|. Then \verb|cargo build --release|.
+  \item \textbf{Runtime} (\verb|debian:bookworm-slim|). Copies just the binary,
+        adds \verb|ca-certificates|, creates \verb|/app/data|, and sets
+        \verb|APP_HOST=0.0.0.0|, \verb|APP_PORT=8080|,
+        \verb|DATABASE_PATH=/app/data/chat.lance|. Exposes 8080.
+\end{enumerate}
+
+\section{Continuous Integration}
+
+Two GitHub Actions workflows live in \verb|.github/workflows/|:
+
+\begin{itemize}
+  \item \textbf{\texttt{release.yml}} --- on every push to \verb|main| (and
+        manually), cross-compiles the server for Linux x86\_64
+        (\verb|x86_64-unknown-linux-gnu|) and macOS Apple Silicon
+        (\verb|aarch64-apple-darwin|), packages each as a \verb|.tar.gz|, and
+        publishes them as a GitHub \emph{pre-release} tagged
+        \verb|build-YYYYMMDD-<short-sha>|. Installs \verb|protoc| and caches the
+        Cargo build.
+  \item \textbf{\texttt{coverage.yml}} --- on pushes to \verb|main|, PRs, and
+        manual runs, uses \verb|cargo llvm-cov| (with
+        \verb|llvm-tools-preview|) to produce \verb|lcov.info|, an HTML report,
+        and a text summary published to the workflow run.
+\end{itemize}
+
+\section{Deploying to DigitalOcean}
+
+\verb|scripts/deploy-digitalocean.sh| is an interactive helper for the App
+Platform. It prompts for the app name, GitHub repo/branch, region, and instance
+size, generates an app-spec YAML, and runs \verb|doctl apps create --wait| (or
+\verb|update|), optionally enabling \verb|deploy_on_push|. Be aware that the App
+Platform filesystem is \emph{ephemeral} by default: a local
+\verb|DATABASE_PATH| is wiped on redeploy. For durable data, attach a persistent
+volume --- or use the object-storage backend
+(Chapter~\ref{chap:object-storage}) so LanceDB persists to a bucket.
+
+\section{Auxiliary Scripts and the Desktop Client}
+
+\begin{itemize}
+  \item \verb|scripts/bots.py| --- a deterministic simulation (idempotent
+        accounts and channels, randomized messages) that drives the server with
+        \emph{real} PyNaCl X25519 encryption, proving cross-implementation
+        compatibility with the JS client. Run via \verb|make bots| (which uses
+        \verb|uv|).
+  \item \verb|scripts/bundle-sodium.sh| --- rebuilds the vendored libsodium
+        bundle shipped in \verb|static/|.
+  \item \verb|desktop/| --- a Tauri v2 native client (Rust + system WebView)
+        wrapping the same web front end.
+\end{itemize}

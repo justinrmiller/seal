@@ -1,0 +1,152 @@
+\chapter{Source Reference}
+\label{chap:source}
+
+A module-by-module tour of \verb|src/|. Earlier chapters explained the
+\emph{why}; this is the \emph{where} --- the map you use when editing a specific
+file. Public items are named so you can grep for them.
+
+\section{\texttt{src/main.rs}}
+The binary entry point. Initializes \verb|tracing_subscriber| with an env filter
+defaulting to \verb|info,tower_http=info|, loads the config, connects and
+initializes the database, assembles \verb|AppState|, builds the router, binds a
+\verb|TcpListener|, and calls \verb|axum::serve| with connect-info so peer IPs
+reach handlers. It is intentionally thin and is the one module not covered by
+unit tests (its logic is exercised through the integration harness instead).
+
+\section{\texttt{src/lib.rs}}
+The library root. It:
+\begin{itemize}
+  \item declares every module (\verb|auth|, \verb|config|, \verb|db|,
+        \verb|db_ops|, \verb|error|, \verb|models|, \verb|rate_limit|,
+        \verb|routes|, \verb|validate|, \verb|ws|);
+  \item embeds \verb|static/| and \verb|templates/| via \verb|include_dir!|;
+  \item defines \verb|AppState| (\S\ref{chap:architecture});
+  \item defines \verb|build_router|, the single source of truth for the route
+        table;
+  \item serves \verb|index| (the embedded \verb|index.html|) and
+        \verb|serve_static| (embedded assets with a \verb|mime_guess| content
+        type), plus an \verb|internal_error| helper that logs and returns a plain
+        500.
+\end{itemize}
+
+\section{\texttt{src/config.rs}}
+Layered configuration; see Chapter~\ref{chap:config}. Public surface:
+\verb|Config| (the resolved struct), \verb|Config::load|, and
+\verb|Config::for_test|. Private helpers: \verb|read_yaml_or_embedded|,
+\verb|project_root|, \verb|env_or|, \verb|env_or_parse|, and the \verb|YamlConfig|
+deserialization structs. Carries a \verb|#[cfg(test)]| module for the cascade.
+
+\section{\texttt{src/db.rs}}
+Schemas and lifecycle; see Chapter~\ref{chap:database}. Public: the five schema
+functions (\verb|users_schema|, \verb|messages_schema|, \verb|attachments_schema|,
+\verb|channels_schema|, \verb|channel_members_schema|), \verb|connect|, and
+\verb|init_db|. Private: \verb|migrate_messages_table|.
+
+\section{\texttt{src/db\_ops.rs}}
+The query toolkit (\S\ref{chap:database}). Public: \verb|open|, \verb|scan_where|,
+\verb|append|, \verb|first_string|, \verb|first_large_string|,
+\verb|collect_string_column|, \verb|total_rows|, \verb|utf8_row|, \verb|mixed_row|
+(with the \verb|Cell| enum), and \verb|rows_to_stored_messages|. Extensively
+unit-tested.
+
+\section{\texttt{src/models.rs}}
+The serde DTOs. Requests (\verb|Deserialize|): \verb|RegisterRequest|,
+\verb|LoginRequest|, \verb|CreateChannelRequest|, \verb|AddChannelMemberRequest|,
+\verb|ChannelEncryptedEnvelope|, \verb|ChannelAttachment|,
+\verb|ChannelMessagePayload|. Query strings: \verb|TokenQuery|, \verb|SearchQuery|,
+\verb|AfterQuery|. Responses (\verb|Serialize|): \verb|TokenResponse|,
+\verb|UserListItem|, \verb|UserPublicKeyResponse|, \verb|ChannelInfo|,
+\verb|ChannelBrowseItem|, \verb|ChannelMemberKey|, \verb|StoredMessage|,
+\verb|AttachmentResponse|. Note the \verb|#[serde(default)]| attributes: channel
+\verb|members| default to empty, \verb|after| to \verb|0.0|, and
+\verb|message_type| to \verb|"text"| via \verb|default_message_type|.
+
+\section{\texttt{src/auth.rs}}
+bcrypt and JWT; see Chapter~\ref{chap:security}. Public: \verb|hash_password|,
+\verb|verify_password|, \verb|create_token|, \verb|require_auth|,
+\verb|decode_token|. Private: the \verb|Claims| struct and \verb|algorithm_from|.
+Unit tests cover the algorithm mapping, password round-trips, token round-trips,
+wrong-secret and garbage rejection, and expiry.
+
+\section{\texttt{src/validate.rs}}
+The input guards \verb|validate_username|, \verb|validate_id|, and
+\verb|validate_after| (\S\ref{chap:security}). \verb|validate_id| and
+\verb|validate_after| are marked \verb|#[allow(dead_code)]| at the definition
+site but are used by the channel/message handlers; the attribute simply suppresses
+a false-positive lint. Unit-tested for accepted and rejected inputs.
+
+\section{\texttt{src/rate\_limit.rs}}
+The \verb|RateLimiter| sliding window (\S\ref{chap:security}): \verb|new|,
+\verb|check|, and a test-only \verb|clear|. The window (60\,s) and cap (20) are
+module constants. Unit-tested for the limit boundary, per-IP isolation, and
+window reset.
+
+\section{\texttt{src/error.rs}}
+\verb|AppError| and its HTTP mapping (\S\ref{chap:security}). Variants:
+\verb|BadRequest(String)|, \verb|Unauthorized(&'static str)|,
+\verb|Forbidden(&'static str)|, \verb|NotFound(String)|, \verb|TooManyRequests|,
+and \verb|Internal(#[from] anyhow::Error)|. \verb|AppResult<T>| is the handler
+return alias. \verb|IntoResponse| renders \verb|{"detail": ...}| with the right
+status and masks internals. Async unit tests assert each variant's status/body
+and the masking of internal errors.
+
+\section{\texttt{src/ws.rs}}
+The \verb|WsConnections| registry (\S\ref{chap:websocket}): \verb|register|,
+\verb|unregister|, \verb|send_to|, \verb|send_to_except|, over a
+\verb|Mutex<HashMap<String, Vec<(Uuid, ConnTx)>>>|. Unit-tested for fan-out to
+multiple connections, the exclusion path, no-op sends, and last-connection
+removal.
+
+\section{\texttt{src/routes/}}
+Handlers, one module per resource. \verb|mod.rs| declares them.
+
+\subsection*{\texttt{auth.rs}}
+\verb|register| and \verb|login| --- rate-limited, validated, bcrypt/JWT-backed
+(Chapter~\ref{chap:http-api}).
+
+\subsection*{\texttt{users.rs}}
+\verb|list_users| (DM peers derived from the messages table),
+\verb|search_users| (rate-limited prefix search, capped at 20), and
+\verb|get_public_key|.
+
+\subsection*{\texttt{channels.rs}}
+The largest handler module. Public handlers: \verb|create_channel|,
+\verb|list_channels|, \verb|browse_channels|, \verb|join_channel|,
+\verb|get_channel|, \verb|add_channel_member|, \verb|get_channel_member_keys|.
+Private helpers worth knowing: \verb|list_channel_member_usernames|,
+\verb|is_channel_member|, \verb|fetch_channel| (returns a private
+\verb|ChannelRow|), \verb|channel_info_for|, \verb|build_member_batch| (inserts
+all members in one \verb|RecordBatch|), and \verb|now_secs|.
+
+\subsection*{\texttt{messages.rs}}
+\verb|get_dm_messages|, \verb|get_channel_messages|, and
+\verb|post_channel_message|. The shared engine lives here too:
+\verb|store_channel_message| (persist one row per envelope + optional attachment,
+returning \verb|ChannelMessageStoreResult|) and \verb|relay_channel_message|
+(push one live frame per envelope). Both are called by the REST handler and by the
+WebSocket channel handler --- the single point that guarantees the two transports
+behave identically. \verb|assert_channel_member| enforces membership.
+
+\subsection*{\texttt{attachments.rs}}
+\verb|get_attachment| --- fetch an encrypted blob with a channel-membership check
+when the attachment is owned by a channel.
+
+\subsection*{\texttt{ws.rs}}
+The WebSocket handler (Chapter~\ref{chap:websocket}): \verb|ws_chat| (upgrade +
+token gate), \verb|handle_socket| (registry + writer task + dispatch loop),
+\verb|handle_dm| (the double-write and three-way relay), and \verb|handle_channel|
+(membership check, then the shared store/relay). \verb|text_msg| wraps a
+\verb|serde_json::Value| into a WS text frame.
+
+\section{Cross-Cutting Idioms}
+A handful of patterns recur and are worth internalizing before making changes:
+\begin{itemize}
+  \item \textbf{Thin handlers.} Validate $\to$ authenticate $\to$ authorize $\to$
+        call \verb|db_ops|/\verb|ws| $\to$ map errors. Business logic that two
+        handlers share is factored out (as with the channel store/relay pair).
+  \item \textbf{Timestamps are \texttt{f64} Unix seconds}, produced by a local
+        \verb|now_secs()| in each module that needs it.
+  \item \textbf{Errors flow through \texttt{AppError}}; use \verb|?| freely and
+        let unexpected failures become masked 500s.
+  \item \textbf{Never interpolate an unvalidated identifier} into a predicate.
+\end{itemize}

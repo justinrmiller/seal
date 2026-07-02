@@ -1,0 +1,165 @@
+\chapter{The REST API}
+\label{chap:http-api}
+
+This chapter is the endpoint reference. Handlers live under \verb|src/routes/|;
+request/response bodies are the \verb|serde| structs in \verb|src/models.rs|.
+
+\section{Conventions}
+
+\begin{itemize}
+  \item \textbf{Authentication is by query-string token.} Protected endpoints
+        read \verb|?token=<jwt>| (modelled by \verb|TokenQuery|, \verb|SearchQuery|,
+        or \verb|AfterQuery|) and call \verb|require_auth|, which returns the
+        username or a \verb|401 {"detail":"Invalid token"}|. This mirrors the
+        original Python server and lets the same token authorize the WebSocket
+        upgrade, which cannot carry custom headers from a browser.
+  \item \textbf{Errors share one shape.} Every failure is
+        \verb|{"detail": "<message>"}| with an appropriate status. See
+        Chapter~\ref{chap:security} and \verb|src/error.rs|.
+  \item \textbf{Status codes.} \verb|200| success, \verb|400| bad request,
+        \verb|401| unauthorized, \verb|403| forbidden, \verb|404| not found,
+        \verb|429| rate-limited, \verb|500| masked internal error. (JSON body
+        validation failures surface as Axum's \verb|422|.)
+\end{itemize}
+
+\section{Authentication --- \texttt{src/routes/auth.rs}}
+
+\subsection*{POST \texttt{/api/register}}
+Rate-limited. Body \verb|RegisterRequest|: \verb|username|, \verb|password|,
+\verb|public_key_jwk|. The handler validates the username, rejects a duplicate
+(\verb|"Username already taken"|), bcrypt-hashes the password, inserts the user
+row, and returns a fresh token:
+
+\begin{lstlisting}
+{ "token": "<jwt>", "username": "alice" }   // TokenResponse
+\end{lstlisting}
+
+\subsection*{POST \texttt{/api/login}}
+Rate-limited. Body \verb|LoginRequest|: \verb|username|, \verb|password|. Looks up
+the user, verifies the password against the stored bcrypt hash, and returns a
+\verb|TokenResponse|. A missing user and a wrong password are deliberately
+indistinguishable: both yield \verb|401 "Invalid credentials"|.
+
+\section{Users --- \texttt{src/routes/users.rs}}
+
+\subsection*{GET \texttt{/api/users}}
+Returns the caller's DM contacts --- everyone they have exchanged direct messages
+with. It derives this from the \verb|messages| table rather than a contacts
+table: the union of recipients of the caller's \verb|'self'| copies and senders
+of DMs addressed to the caller.
+
+\begin{lstlisting}
+sent     = messages WHERE sender = <me>    AND channel_id = 'self'
+received = messages WHERE recipient = <me> AND channel_id = ''
+peers    = sorted-unique( sent.recipient  U  received.sender )
+\end{lstlisting}
+
+Response: a JSON array of \verb|{ "username": ... }| (\verb|UserListItem|).
+
+\subsection*{GET \texttt{/api/users/search?q=<prefix>}}
+Rate-limited. Prefix-matches usernames (\verb|username LIKE '<q>%'|), excludes the
+caller, and truncates to 20 results. \verb|q| is required and is itself validated
+as a username so the \verb|LIKE| pattern cannot contain metacharacters.
+
+\subsection*{GET \texttt{/api/users/\{target\}/public\_key}}
+Returns \verb|{ "username", "public_key_jwk" }| (\verb|UserPublicKeyResponse|) so
+a client can encrypt to \verb|target|. \verb|404 "User not found"| if absent.
+
+\section{Channels --- \texttt{src/routes/channels.rs}}
+
+\subsection*{POST \texttt{/api/channels}}
+Body \verb|CreateChannelRequest|: \verb|name| and optional \verb|members|. The
+handler validates the name (same charset/length as a username) and every named
+member, \textbf{rejects a duplicate channel name}, then verifies that the creator
+and every named member actually exist in \verb|users|. It assigns a UUID, writes
+the \verb|channels| row, and inserts all membership rows in a single batch (the
+creator is always included and de-duplicated). Returns \verb|ChannelInfo|:
+
+\begin{lstlisting}
+{ "id", "name", "created_by", "members": ["alice", "bob", ...] }
+\end{lstlisting}
+
+\subsection*{GET \texttt{/api/channels}}
+Lists channels the caller belongs to. It reads the caller's \verb|channel_members|
+rows, then fetches each channel and its full member list, returning an array of
+\verb|ChannelInfo|.
+
+\subsection*{GET \texttt{/api/channels/browse}}
+The inverse: channels the caller is \emph{not} in. It scans all channels, skips
+those in the caller's membership set, and returns \verb|ChannelBrowseItem|
+objects that carry a \verb|member_count| instead of the full roster:
+
+\begin{lstlisting}
+{ "id", "name", "created_by", "member_count": 7 }
+\end{lstlisting}
+
+\subsection*{POST \texttt{/api/channels/\{id\}/join}}
+Adds the caller to a channel. \verb|404| if the channel does not exist,
+\verb|400 "Already a member"| if they are in it. On success returns the updated
+\verb|ChannelInfo|.
+
+\subsection*{GET \texttt{/api/channels/\{id\}}}
+Returns \verb|ChannelInfo| \emph{only} to members; non-members get
+\verb|403 "Not a member of this channel"|.
+
+\subsection*{POST \texttt{/api/channels/\{id\}/members}}
+Body \verb|AddChannelMemberRequest|: \verb|username|. The caller must be a member
+(\verb|403| otherwise); the target must exist (\verb|404|) and not already be a
+member (\verb|400|). On success returns \verb|{"status": "ok"}|.
+
+\subsection*{GET \texttt{/api/channels/\{id\}/members/public\_keys}}
+Members-only. Returns an array of \verb|ChannelMemberKey|
+(\verb|{ "username", "public_key_jwk" }|) --- exactly what a client needs to
+encrypt one envelope per recipient before posting a channel message.
+
+\section{Messages --- \texttt{src/routes/messages.rs}}
+
+\subsection*{GET \texttt{/api/messages/\{peer\}?after=<ts>}}
+Direct-message history with one peer. Reads two slices of the \verb|messages|
+table and merges them, sorted by timestamp:
+
+\begin{lstlisting}
+sent-self = WHERE sender=<me>   AND recipient=<peer> AND channel_id='self'
+received  = WHERE sender=<peer> AND recipient=<me>   AND channel_id=''
+\end{lstlisting}
+
+The optional \verb|after| (a float Unix timestamp, validated by
+\verb|validate_after|) appends \verb|AND timestamp > <after>| to both queries for
+incremental polling. Each row is a \verb|StoredMessage|.
+
+\subsection*{GET \texttt{/api/channels/\{id\}/messages?after=<ts>}}
+Channel history for the caller. Members-only. Returns only the rows encrypted
+\emph{for the caller} (\verb|channel_id = <id> AND recipient = <me>|), sorted by
+timestamp --- the fan-out storage model (Chapter~\ref{chap:security}) means each
+member reads their own copies.
+
+\subsection*{POST \texttt{/api/channels/\{id\}/messages}}
+The REST alternative to sending over the WebSocket. Body
+\verb|ChannelMessagePayload|:
+
+\begin{lstlisting}
+{
+  "channel_id": "<uuid>",
+  "envelopes": [
+    { "target_user", "ciphertext", "iv", "sender_public_key_jwk" }, ...
+  ],
+  "message_type": "text" | "image",     // default "text"
+  "attachment": { "encrypted_data", "iv" }   // optional, images only
+}
+\end{lstlisting}
+
+Members-only. It calls the shared \verb|store_channel_message| (one row per
+envelope; an image also writes one \verb|attachments| row) and then
+\verb|relay_channel_message| to push a live frame to any connected recipient.
+Returns \verb|{ "status":"ok", "group_id", "timestamp" }|. This handler and the
+WebSocket channel handler share the very same persistence and relay functions.
+
+\section{Attachments --- \texttt{src/routes/attachments.rs}}
+
+\subsection*{GET \texttt{/api/attachments/\{id\}}}
+Fetches an encrypted attachment blob. If the attachment belongs to a channel, the
+caller must be a member of that channel (\verb|403| otherwise); attachments with
+an empty \verb|channel_id| skip that check. \verb|404| if the id is unknown.
+Returns \verb|AttachmentResponse|: \verb|{ "id", "encrypted_data", "iv" }|. As
+everywhere, \verb|encrypted_data| is ciphertext --- the server cannot render the
+image.
