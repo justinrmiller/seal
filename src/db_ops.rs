@@ -206,3 +206,158 @@ pub fn collect_string_column(batches: &[RecordBatch], column: &str) -> Vec<Strin
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
+
+    /// A one-column Utf8 batch whose single row may be null.
+    fn utf8_batch(column: &str, values: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(column, DataType::Utf8, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+    }
+
+    #[test]
+    fn utf8_row_fills_fields_by_name_regardless_of_order() {
+        let batch = utf8_row(
+            db::users_schema(),
+            &[
+                ("public_key_jwk", "pk"),
+                ("username", "alice"),
+                ("password_hash", "h"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(first_string(&[batch.clone()], "username").as_deref(), Some("alice"));
+        assert_eq!(first_string(&[batch], "public_key_jwk").as_deref(), Some("pk"));
+    }
+
+    #[test]
+    fn utf8_row_errors_when_a_field_is_missing() {
+        let err = utf8_row(db::users_schema(), &[("username", "alice")]).unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn mixed_row_builds_mixed_typed_columns() {
+        // attachments_schema: id, sender, channel_id (Utf8), encrypted_data
+        // (LargeUtf8), iv (Utf8), timestamp (Float64).
+        let batch = mixed_row(
+            db::attachments_schema(),
+            &[
+                Cell::Str("att-1"),
+                Cell::Str("alice"),
+                Cell::Str("chan-1"),
+                Cell::LargeStr("ciphertext"),
+                Cell::Str("iv"),
+                Cell::F64(42.0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(first_string(&[batch.clone()], "id").as_deref(), Some("att-1"));
+        assert_eq!(
+            first_large_string(&[batch], "encrypted_data").as_deref(),
+            Some("ciphertext")
+        );
+    }
+
+    #[test]
+    fn mixed_row_errors_on_wrong_cell_count() {
+        let err = mixed_row(db::attachments_schema(), &[Cell::Str("only-one")]).unwrap_err();
+        assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn first_string_reads_value_null_and_missing_cases() {
+        // Present value.
+        assert_eq!(
+            first_string(&[utf8_batch("c", vec![Some("v")])], "c").as_deref(),
+            Some("v")
+        );
+        // Null cell maps to an empty string, not None.
+        assert_eq!(
+            first_string(&[utf8_batch("c", vec![None])], "c").as_deref(),
+            Some("")
+        );
+        // Missing column yields None.
+        assert_eq!(first_string(&[utf8_batch("c", vec![Some("v")])], "nope"), None);
+        // No non-empty batch yields None.
+        assert_eq!(first_string(&[], "c"), None);
+        assert_eq!(first_string(&[utf8_batch("c", vec![])], "c"), None);
+    }
+
+    #[test]
+    fn first_string_skips_empty_batches_and_returns_first_populated() {
+        let batches = vec![utf8_batch("c", vec![]), utf8_batch("c", vec![Some("second")])];
+        assert_eq!(first_string(&batches, "c").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn first_large_string_handles_null_and_wrong_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::LargeUtf8, true)]));
+        let null_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(LargeStringArray::from(vec![None as Option<&str>]))])
+                .unwrap();
+        assert_eq!(first_large_string(&[null_batch], "d").as_deref(), Some(""));
+        // Column exists but is the wrong array type -> None (no panic).
+        assert_eq!(first_large_string(&[utf8_batch("d", vec![Some("v")])], "d"), None);
+    }
+
+    #[test]
+    fn total_rows_sums_across_batches() {
+        let batches = vec![
+            utf8_batch("c", vec![Some("a"), Some("b")]),
+            utf8_batch("c", vec![Some("c")]),
+            utf8_batch("c", vec![]),
+        ];
+        assert_eq!(total_rows(&batches), 3);
+        assert_eq!(total_rows(&[]), 0);
+    }
+
+    #[test]
+    fn collect_string_column_gathers_non_null_across_batches() {
+        let batches = vec![
+            utf8_batch("c", vec![Some("a"), None, Some("b")]),
+            utf8_batch("c", vec![Some("c")]),
+        ];
+        assert_eq!(collect_string_column(&batches, "c"), vec!["a", "b", "c"]);
+        // Missing column contributes nothing.
+        assert!(collect_string_column(&batches, "missing").is_empty());
+    }
+
+    #[test]
+    fn rows_to_stored_messages_maps_all_columns() {
+        let batch = mixed_row(
+            db::messages_schema(),
+            &[
+                Cell::Str("m1"),
+                Cell::Str("alice"),
+                Cell::Str("bob"),
+                Cell::Str("chan"),
+                Cell::Str("ct"),
+                Cell::Str("iv"),
+                Cell::Str("spk"),
+                Cell::F64(123.5),
+                Cell::Str("text"),
+                Cell::Str("att"),
+            ],
+        )
+        .unwrap();
+        let msgs = rows_to_stored_messages(&[batch]);
+        assert_eq!(msgs.len(), 1);
+        let m = &msgs[0];
+        assert_eq!(m.id, "m1");
+        assert_eq!(m.sender, "alice");
+        assert_eq!(m.recipient, "bob");
+        assert_eq!(m.channel_id, "chan");
+        assert_eq!(m.timestamp, 123.5);
+        assert_eq!(m.message_type, "text");
+        assert_eq!(m.attachment_id, "att");
+        // Empty batches contribute no messages.
+        assert!(rows_to_stored_messages(&[]).is_empty());
+    }
+}

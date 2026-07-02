@@ -44,3 +44,52 @@ impl RateLimiter {
             .clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, last))
+    }
+
+    #[test]
+    fn allows_up_to_the_limit_then_rejects() {
+        let rl = RateLimiter::new();
+        let addr = ip(1);
+        for i in 0..RATE_LIMIT_MAX {
+            assert!(rl.check(addr).is_ok(), "request {i} should be allowed");
+        }
+        let err = rl.check(addr).expect_err("over the limit");
+        assert!(matches!(err, AppError::TooManyRequests));
+    }
+
+    #[test]
+    fn limits_are_tracked_per_ip() {
+        let rl = RateLimiter::new();
+        // Exhaust one IP entirely.
+        for _ in 0..RATE_LIMIT_MAX {
+            rl.check(ip(1)).unwrap();
+        }
+        assert!(matches!(
+            rl.check(ip(1)).unwrap_err(),
+            AppError::TooManyRequests
+        ));
+        // A different IP is unaffected.
+        assert!(rl.check(ip(2)).is_ok());
+    }
+
+    #[test]
+    fn clear_resets_the_window() {
+        let rl = RateLimiter::new();
+        let addr = ip(1);
+        for _ in 0..RATE_LIMIT_MAX {
+            rl.check(addr).unwrap();
+        }
+        assert!(rl.check(addr).is_err());
+        rl.clear();
+        // After clearing, the full budget is available again.
+        assert!(rl.check(addr).is_ok());
+    }
+}
