@@ -11,7 +11,7 @@ make dev
 # Start the server (http://localhost:8000)
 make server
 
-# Run all 62 native Rust integration tests
+# Run all 74 native Rust integration tests
 make test
 ```
 
@@ -123,6 +123,11 @@ Browser (libsodium)           Server (Rust / axum)          Storage (LanceDB)
 └──────────────────┘    └─────────────────────┘    └──────────────────┘
 ```
 
+The LanceDB dataset (all tables plus encrypted attachments) can live on the
+local filesystem *or* on object storage — see [Object Storage](#object-storage).
+`GET /health` (liveness) and `GET /readyz` (readiness; pings the database) are
+exposed for orchestrators and load balancers.
+
 ### Encryption Flow (DM)
 
 ```
@@ -217,14 +222,43 @@ cp .env.example .env
 | `APP_TITLE` | `Seal` | Application title |
 | `APP_HOST` | `0.0.0.0` | Server bind address |
 | `APP_PORT` | `8000` | Server port |
-| `DATABASE_PATH` | `data/chat.lance` | LanceDB storage path |
+| `DATABASE_PATH` | `data/chat.lance` | LanceDB path — a local path or an object-store URI (see below) |
 | `AUTH_JWT_ALGORITHM` | `HS256` | JWT signing algorithm |
 | `AUTH_TOKEN_EXPIRE_MINUTES` | `1440` | Token expiry (24 hours) |
+
+### Object Storage
+
+`DATABASE_PATH` can point at object storage instead of a local path, which keeps
+the server stateless for containerized deploys. The whole LanceDB dataset —
+users, messages, **and** encrypted attachments — lives in the bucket.
+
+| Scheme | Backend |
+|--------|---------|
+| `s3://`, `s3a://` | AWS S3 / S3-compatible (MinIO, Cloudflare R2, LocalStack) |
+| `s3+ddb://` | S3 with DynamoDB commit locking (safe for concurrent writers) |
+| `gs://`, `gcs://` | Google Cloud Storage |
+| `az://`, `azure://`, `abfs://`, `abfss://` | Azure Blob Storage |
+
+Credentials come from the standard cloud env vars (`AWS_ACCESS_KEY_ID`,
+`GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT_NAME`, …) or from a
+`storage:` block in `config.yaml` using the object_store-native key names
+(`aws_endpoint`, `aws_region`, `allow_http`, …). See `config.yaml` and
+`.env.example` for full examples.
+
+> **Concurrency:** plain `s3://` has no safe concurrent-write story — concurrent
+> commits can clobber each other, and Seal writes messages concurrently. For
+> production S3 with multiple writers, use `s3+ddb://` with a DynamoDB lock table
+> (or keep a single writer). The server logs a warning at startup when it detects
+> a plain `s3://` path.
+
+Building the server with the object-store backends requires `protoc` (the
+Protocol Buffers compiler) at build time — `apt-get install protobuf-compiler`
+on Debian/Ubuntu, `brew install protobuf` on macOS.
 
 ## Testing
 
 ```bash
-# Run all 62 native Rust integration tests
+# Run all 74 native Rust integration tests
 make test
 ```
 
@@ -238,6 +272,7 @@ Tests cover:
 - **Messages** — DM history, channel messages, REST sending, timestamp filtering
 - **Attachments** — Image attachment storage and access control
 - **WebSocket** — Connection, DM relay, channel relay with fan-out, non-member rejection
+- **Health** — `/health` liveness and `/readyz` readiness probes
 - **Schema migration** — Legacy messages-table column auto-upgrade
 
 ## Bot Simulation

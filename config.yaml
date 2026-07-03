@@ -14,13 +14,19 @@ database:
 # Options forwarded to LanceDB's storage layer. Only needed for object storage,
 # and only for values not already provided via standard cloud env vars
 # (AWS_ACCESS_KEY_ID, GOOGLE_APPLICATION_CREDENTIALS, AZURE_STORAGE_ACCOUNT_NAME, ...).
-# Example for an S3-compatible endpoint such as MinIO or LocalStack:
+# Use the object_store-native key names (aws_endpoint, aws_region, ...) so the
+# keys here match the ones used elsewhere in the project. Example for an
+# S3-compatible endpoint such as MinIO or LocalStack:
 # storage:
-#   endpoint: "http://localhost:4566"
-#   region: "us-east-1"
+#   aws_endpoint: "http://localhost:4566"
+#   aws_region: "us-east-1"
 #   allow_http: "true"
 #   aws_access_key_id: "test"
 #   aws_secret_access_key: "test"
+#
+# For safe CONCURRENT writes against real AWS S3, use DynamoDB commit locking by
+# pointing the path at "s3+ddb://my-bucket/chat.lance" and adding a lock table,
+# e.g. `aws_dynamodb_table: "seal-commit-lock"`. Plain "s3://" is single-writer.
 
 auth:
   jwt_algorithm: "HS256"

@@ -83,6 +83,8 @@ pub async fn run(cfg: Arc<Config>) -> anyhow::Result<()> {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/health", get(routes::health::health))
+        .route("/readyz", get(routes::health::readyz))
         .route("/api/register", post(routes::auth::register))
         .route("/api/login", post(routes::auth::login))
         .route("/api/users", get(routes::users::list_users))

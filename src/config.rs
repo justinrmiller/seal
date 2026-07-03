@@ -6,9 +6,19 @@ use serde::Deserialize;
 
 /// URI schemes that address object storage rather than the local filesystem.
 /// A `database.path` beginning with one of these is handed to LanceDB verbatim
-/// (no project-root joining, no local directory creation).
+/// (no project-root joining, no local directory creation). `s3+ddb://` is S3
+/// with DynamoDB commit locking, which is the safe way to run concurrent
+/// writers against S3.
 const OBJECT_STORE_SCHEMES: &[&str] = &[
-    "s3://", "s3a://", "gs://", "gcs://", "az://", "azure://", "abfs://", "abfss://",
+    "s3://",
+    "s3a://",
+    "s3+ddb://",
+    "gs://",
+    "gcs://",
+    "az://",
+    "azure://",
+    "abfs://",
+    "abfss://",
 ];
 
 /// Returns true if `location` is an object-store URI (S3/GCS/Azure) rather than
@@ -18,6 +28,56 @@ pub fn is_object_store_uri(location: &str) -> bool {
     OBJECT_STORE_SCHEMES
         .iter()
         .any(|scheme| location.starts_with(scheme))
+}
+
+/// Redact anything credential-like from a database location so it is safe to
+/// log. Object-store URIs don't normally embed credentials, but strip any
+/// `scheme://user:pass@host` userinfo defensively so a secret can never reach
+/// the logs.
+pub fn redact_location(location: &str) -> String {
+    if let Some((scheme, rest)) = location.split_once("://") {
+        if let Some((_userinfo, host)) = rest.split_once('@') {
+            return format!("{scheme}://***@{host}");
+        }
+    }
+    location.to_string()
+}
+
+/// Validate the storage configuration for a resolved database location and
+/// surface operational caveats. Errors on unambiguous misconfiguration; warns
+/// on risky-but-valid setups. Called from [`Config::load`] so problems fail
+/// fast at startup rather than as an opaque connect error later.
+fn validate_storage_config(
+    location: &str,
+    storage_options: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if !is_object_store_uri(location) {
+        // `storage:` options only apply to object storage. Providing them for a
+        // local path is almost certainly a mistake — they'd be silently dropped.
+        if !storage_options.is_empty() {
+            anyhow::bail!(
+                "`storage:` options were provided but the database path ({location}) is a local \
+                 filesystem path, so those options would be silently ignored. Remove the \
+                 `storage:` block, or point the database path at an object-store URI \
+                 (e.g. s3://, gs://, az://)."
+            );
+        }
+        return Ok(());
+    }
+
+    // Plain S3 has no safe concurrent-write story: without DynamoDB commit
+    // locking (the `s3+ddb://` scheme), concurrent writers can clobber one
+    // another's commits. Seal writes messages concurrently, so warn loudly.
+    if location.starts_with("s3://") || location.starts_with("s3a://") {
+        tracing::warn!(
+            "database is on S3 ({}) without DynamoDB commit locking; concurrent writers can \
+             clobber each other's commits. Use the `s3+ddb://` scheme with a lock table (or a \
+             single writer) for production S3.",
+            redact_location(location)
+        );
+    }
+
+    Ok(())
 }
 
 /// Default `config.yaml` baked into the binary at build time. Disk
@@ -112,18 +172,31 @@ impl Config {
         let app_port: u16 = env_or_parse("APP_PORT", yaml.app.port)?;
 
         let database_location = env_or("DATABASE_PATH", &yaml.database.path);
-        let database_path = if is_object_store_uri(&database_location) {
+        let remote = is_object_store_uri(&database_location);
+        let database_path = if remote {
             // Object-store URIs are handed to LanceDB verbatim — never joined
             // onto the project root or otherwise normalized as a local path.
-            PathBuf::from(database_location)
+            PathBuf::from(&database_location)
         } else {
-            let database_path = PathBuf::from(database_location);
+            let database_path = PathBuf::from(&database_location);
             if database_path.is_absolute() {
                 database_path
             } else {
                 project_root.join(database_path)
             }
         };
+
+        // Fail fast on misconfigured storage, and warn on risky-but-valid setups.
+        validate_storage_config(&database_location, &yaml.storage)?;
+        tracing::info!(
+            "database location: {} ({})",
+            redact_location(&database_path.to_string_lossy()),
+            if remote {
+                "object storage"
+            } else {
+                "local filesystem"
+            }
+        );
 
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
             tracing::warn!(
@@ -275,9 +348,42 @@ mod tests {
             assert!(is_object_store_uri(uri), "{uri} should be a remote URI");
         }
 
+        // S3 with DynamoDB commit locking is still object storage.
+        assert!(is_object_store_uri("s3+ddb://bucket/chat.lance"));
+
         for path in ["data/chat.lance", "/abs/path/chat.lance", "chat.lance"] {
             assert!(!is_object_store_uri(path), "{path} should be local");
         }
+    }
+
+    #[test]
+    fn redact_location_strips_userinfo_but_keeps_plain_locations() {
+        // No credentials to hide: returned unchanged.
+        assert_eq!(
+            redact_location("s3://bucket/chat.lance"),
+            "s3://bucket/chat.lance"
+        );
+        assert_eq!(redact_location("data/chat.lance"), "data/chat.lance");
+        // Any embedded userinfo is masked so it can't leak into logs.
+        assert_eq!(
+            redact_location("s3://key:secret@bucket/chat.lance"),
+            "s3://***@bucket/chat.lance"
+        );
+    }
+
+    #[test]
+    fn validate_storage_rejects_options_on_a_local_path() {
+        let mut opts = HashMap::new();
+        opts.insert("aws_region".to_string(), "us-east-1".to_string());
+        // Options on a local path are a misconfiguration: they'd be ignored.
+        assert!(validate_storage_config("data/chat.lance", &opts).is_err());
+        // Same options on a remote URI are fine.
+        assert!(validate_storage_config("s3://bucket/chat.lance", &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_storage_allows_local_path_without_options() {
+        assert!(validate_storage_config("data/chat.lance", &HashMap::new()).is_ok());
     }
 
     #[test]

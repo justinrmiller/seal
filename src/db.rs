@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use anyhow::Context;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::connection::Connection;
 use lancedb::table::NewColumnTransform;
+
+use crate::config::{is_object_store_uri, redact_location};
 
 pub fn users_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -63,7 +66,8 @@ pub async fn connect(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", location.display()))?;
 
-    if crate::config::is_object_store_uri(path_str) {
+    let remote = is_object_store_uri(path_str);
+    if remote {
         // Object storage: hand the URI to LanceDB and let object_store manage it.
         // No local directory to create.
     } else if let Some(parent) = location.parent() {
@@ -74,8 +78,20 @@ pub async fn connect(
     if !storage_options.is_empty() {
         builder = builder.storage_options(storage_options.clone());
     }
-    let conn = builder.execute().await?;
-    Ok(conn)
+    builder.execute().await.with_context(|| {
+        let redacted = redact_location(path_str);
+        if remote {
+            // Remote failures are usually credentials/region/endpoint/TLS, none
+            // of which LanceDB's raw error makes obvious.
+            format!(
+                "connecting to object-store database at {redacted}. Check the bucket exists and \
+                 that credentials, region, and endpoint are set (via the `storage:` block or \
+                 standard cloud env vars); for a custom HTTP endpoint set `allow_http=true`."
+            )
+        } else {
+            format!("connecting to database at {redacted}")
+        }
+    })
 }
 
 pub async fn init_db(conn: &Connection) -> anyhow::Result<()> {
