@@ -11,7 +11,7 @@ make dev
 # Start the server (http://localhost:8000)
 make server
 
-# Run all 74 native Rust integration tests
+# Run all 75 native Rust integration tests
 make test
 ```
 
@@ -251,6 +251,12 @@ Credentials come from the standard cloud env vars (`AWS_ACCESS_KEY_ID`,
 > (or keep a single writer). The server logs a warning at startup when it detects
 > a plain `s3://` path.
 
+On object storage the connect **retry budget defaults to 30s** so an unreachable
+bucket fails fast (lance-io's own default is ~180s); override with
+`client_retry_timeout` / `client_max_retries` in the `storage:` block. Attachment
+uploads are capped at `attachments.max_image_size_mb` (default 5 MB) and rejected
+with `413 Payload Too Large` before anything is written to the bucket.
+
 Building the server with the object-store backends requires `protoc` (the
 Protocol Buffers compiler) at build time — `apt-get install protobuf-compiler`
 on Debian/Ubuntu, `brew install protobuf` on macOS.
@@ -258,7 +264,7 @@ on Debian/Ubuntu, `brew install protobuf` on macOS.
 ## Testing
 
 ```bash
-# Run all 74 native Rust integration tests
+# Run all 75 native Rust integration tests
 make test
 ```
 
@@ -273,6 +279,7 @@ Tests cover:
 - **Attachments** — Image attachment storage and access control
 - **WebSocket** — Connection, DM relay, channel relay with fan-out, non-member rejection
 - **Health** — `/health` liveness and `/readyz` readiness probes
+- **Object storage** — remote-URI detection, fail-fast on an unreachable bucket
 - **Schema migration** — Legacy messages-table column auto-upgrade
 
 ## Bot Simulation

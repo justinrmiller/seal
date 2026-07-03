@@ -84,7 +84,7 @@ fn validate_storage_config(
 /// `config.yaml` at the project root overrides it; env vars override either.
 const EMBEDDED_CONFIG_YAML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml"));
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub app_title: String,
     pub app_host: String,
@@ -101,6 +101,31 @@ pub struct Config {
     pub max_image_size_bytes: usize,
     pub safe_name_re: Regex,
     pub safe_id_re: Regex,
+}
+
+// Hand-written so credentials can never reach logs. `jwt_secret` is masked and
+// `storage_options` (which may hold `aws_secret_access_key`, etc.) is shown as
+// its keys only — values redacted — even if a `Config` is ever `{:?}`-formatted.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut storage_keys: Vec<&str> = self.storage_options.keys().map(|k| k.as_str()).collect();
+        storage_keys.sort_unstable();
+        f.debug_struct("Config")
+            .field("app_title", &self.app_title)
+            .field("app_host", &self.app_host)
+            .field("app_port", &self.app_port)
+            .field("database_path", &self.database_path)
+            .field("storage_options", &format_args!("{storage_keys:?} (values redacted)"))
+            .field("jwt_secret", &"***")
+            .field("jwt_algorithm", &self.jwt_algorithm)
+            .field("token_expire_minutes", &self.token_expire_minutes)
+            .field("username_max_length", &self.username_max_length)
+            .field("id_max_length", &self.id_max_length)
+            .field("max_image_size_bytes", &self.max_image_size_bytes)
+            .field("safe_name_re", &self.safe_name_re)
+            .field("safe_id_re", &self.safe_id_re)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +409,21 @@ mod tests {
     #[test]
     fn validate_storage_allows_local_path_without_options() {
         assert!(validate_storage_config("data/chat.lance", &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets() {
+        let mut cfg =
+            Config::for_test(PathBuf::from("data/t.lance"), "super-secret-jwt".into()).unwrap();
+        cfg.storage_options
+            .insert("aws_secret_access_key".into(), "top-secret-value".into());
+        let dbg = format!("{cfg:?}");
+        // Neither the JWT secret nor any storage-option value may appear.
+        assert!(!dbg.contains("super-secret-jwt"), "jwt secret leaked: {dbg}");
+        assert!(!dbg.contains("top-secret-value"), "storage value leaked: {dbg}");
+        // Storage-option keys are safe to show; secrets read as ***.
+        assert!(dbg.contains("aws_secret_access_key"));
+        assert!(dbg.contains("***"));
     }
 
     #[test]

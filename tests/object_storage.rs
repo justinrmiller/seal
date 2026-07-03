@@ -19,9 +19,43 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use seal_server::db_ops::Cell;
 use seal_server::{db, db_ops};
+
+/// Unlike the round-trip test below, this one needs NO object store and runs in
+/// normal CI. It drives the startup path (connect + init_db) against an
+/// unreachable endpoint with the retry budget zeroed and asserts it fails FAST
+/// rather than hanging on lance-io's ~180s default. Regression test for the
+/// bounded-retry improvement. (`db::connect` alone is lazy for dir-based
+/// namespaces, so `init_db` is what forces the network round-trip.)
+#[tokio::test]
+async fn unreachable_object_store_fails_fast() {
+    let mut opts = HashMap::new();
+    opts.insert("aws_endpoint".into(), "http://127.0.0.1:1".into());
+    opts.insert("allow_http".into(), "true".into());
+    opts.insert("aws_region".into(), "us-east-1".into());
+    opts.insert("aws_access_key_id".into(), "test".into());
+    opts.insert("aws_secret_access_key".into(), "test".into());
+    // Zero the retry budget so a refused connection surfaces immediately
+    // instead of retrying for lance-io's default 180 seconds.
+    opts.insert("client_max_retries".into(), "0".into());
+    opts.insert("client_retry_timeout".into(), "1".into());
+
+    let startup = async {
+        let conn = db::connect(Path::new("s3://seal-unreachable/it.lance"), &opts).await?;
+        db::init_db(&conn).await
+    };
+    let result = tokio::time::timeout(Duration::from_secs(30), startup)
+        .await
+        .expect("startup against an unreachable bucket should fail fast, not hang");
+
+    assert!(
+        result.is_err(),
+        "startup against an unreachable object store must return an error"
+    );
+}
 
 /// Build LanceDB storage options from the test environment. Falls back to the
 /// conventional moto/LocalStack dummy credentials.

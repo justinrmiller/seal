@@ -1,6 +1,7 @@
 //! Small helpers around LanceDB Tables to keep route code uncluttered.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, Float64Array, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
@@ -12,6 +13,15 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::Table;
 
 use crate::error::AppError;
+
+/// Seconds since the Unix epoch as an f64 — the timestamp format used across
+/// every table. Shared by the route handlers so the definition isn't repeated.
+pub fn now_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
 
 /// Open a table by name. Wraps the lancedb error into AppError::Internal.
 pub async fn open(conn: &Connection, name: &str) -> Result<Table, AppError> {
@@ -186,6 +196,68 @@ pub fn mixed_row(schema: SchemaRef, cells: &[Cell<'_>]) -> Result<RecordBatch, A
     }
     RecordBatch::try_new(schema, columns)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("record batch: {e}")))
+}
+
+/// Build a multi-row RecordBatch from N rows of [`Cell`]s so several rows are
+/// written in a single append (one LanceDB commit) instead of one per row.
+/// Every row must list every field in the schema in order, and a given column
+/// must use the same `Cell` variant across all rows. `rows` must be non-empty
+/// (the column types are taken from the first row).
+pub fn mixed_rows(schema: SchemaRef, rows: &[&[Cell<'_>]]) -> Result<RecordBatch, AppError> {
+    let ncols = schema.fields().len();
+    let Some(first) = rows.first() else {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "mixed_rows: called with no rows"
+        )));
+    };
+    for (i, row) in rows.iter().enumerate() {
+        if row.len() != ncols {
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "mixed_rows: row {i} has {} cells, expected {ncols}",
+                row.len()
+            )));
+        }
+    }
+
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(ncols);
+    for (j, template) in first.iter().enumerate() {
+        let col: Arc<dyn Array> = match template {
+            Cell::Str(_) => Arc::new(StringArray::from(collect_col_str(rows, j, false)?)),
+            Cell::LargeStr(_) => Arc::new(LargeStringArray::from(collect_col_str(rows, j, true)?)),
+            Cell::F64(_) => {
+                let vals: Vec<f64> = rows
+                    .iter()
+                    .map(|r| match r[j] {
+                        Cell::F64(v) => Ok(v),
+                        _ => Err(AppError::Internal(anyhow::anyhow!(
+                            "mixed_rows: column {j} has mixed cell types"
+                        ))),
+                    })
+                    .collect::<Result<_, _>>()?;
+                Arc::new(Float64Array::from(vals))
+            }
+        };
+        columns.push(col);
+    }
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("record batch: {e}")))
+}
+
+/// Gather column `j` as strings, requiring every cell to be `Str` (when
+/// `large` is false) or `LargeStr` (when true). Used by [`mixed_rows`].
+fn collect_col_str<'a>(
+    rows: &[&[Cell<'a>]],
+    j: usize,
+    large: bool,
+) -> Result<Vec<&'a str>, AppError> {
+    rows.iter()
+        .map(|r| match (&r[j], large) {
+            (Cell::Str(s), false) | (Cell::LargeStr(s), true) => Ok(*s),
+            _ => Err(AppError::Internal(anyhow::anyhow!(
+                "mixed_rows: column {j} has mixed cell types"
+            ))),
+        })
+        .collect()
 }
 
 /// Collect every value from a Utf8 column across all batches into a Vec.

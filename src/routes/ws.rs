@@ -2,8 +2,6 @@
 //! messages, dispatching to handle_dm / handle_channel and registering this
 //! connection in the AppState's WsConnections so other handlers can relay.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
@@ -91,13 +89,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, username: String) {
     let _ = writer.await;
 }
 
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 async fn handle_dm(
     state: &AppState,
     sender: &str,
@@ -124,60 +115,71 @@ async fn handle_dm(
         .unwrap_or("text");
     let msg_type = if raw_type == "image" { "image" } else { "text" };
 
+    // For image DMs the encrypted image rides inline in `ciphertext`; bound it
+    // before writing to (object) storage, just like the channel attachment path.
+    if msg_type == "image" && ciphertext.len() > state.cfg.max_image_size_bytes {
+        let _ = own_tx.send(text_msg(&json!({
+            "error": format!(
+                "Image exceeds the maximum size of {} bytes",
+                state.cfg.max_image_size_bytes
+            )
+        })));
+        return Ok(());
+    }
+
     let msg_id = Uuid::new_v4().to_string();
-    let ts = now_secs();
+    let ts = db_ops::now_secs();
 
     let messages = db_ops::open(&state.conn, "messages")
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let row = db_ops::mixed_row(
-        db::messages_schema(),
-        &[
-            Cell::Str(&msg_id),
-            Cell::Str(sender),
-            Cell::Str(recipient),
-            Cell::Str(""),
-            Cell::Str(ciphertext),
-            Cell::Str(iv),
-            Cell::Str(spk),
-            Cell::F64(ts),
-            Cell::Str(msg_type),
-            Cell::Str(""),
-        ],
-    )
-    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    db_ops::append(&messages, row)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    // Sender's self-copy (so they can decrypt their own DMs in history).
+    // The recipient row and the sender's optional self-copy (so the sender can
+    // decrypt their own DMs in history) share one schema, so write both in a
+    // SINGLE append — one LanceDB commit instead of two round-trips per DM.
+    let recipient_row = [
+        Cell::Str(&msg_id),
+        Cell::Str(sender),
+        Cell::Str(recipient),
+        Cell::Str(""),
+        Cell::Str(ciphertext),
+        Cell::Str(iv),
+        Cell::Str(spk),
+        Cell::F64(ts),
+        Cell::Str(msg_type),
+        Cell::Str(""),
+    ];
+
     let self_ct = data.get("self_ciphertext").and_then(|v| v.as_str());
     let self_iv = data.get("self_iv").and_then(|v| v.as_str());
     let self_spk = data
         .get("self_sender_public_key_jwk")
         .and_then(|v| v.as_str());
+    let self_id = Uuid::new_v4().to_string();
+
+    let mut rows: Vec<&[Cell<'_>]> = vec![&recipient_row];
+    let self_row;
     if let (Some(self_ct), Some(self_iv), Some(self_spk)) = (self_ct, self_iv, self_spk) {
-        let self_id = Uuid::new_v4().to_string();
-        let row = db_ops::mixed_row(
-            db::messages_schema(),
-            &[
-                Cell::Str(&self_id),
-                Cell::Str(sender),
-                Cell::Str(recipient),
-                Cell::Str("self"),
-                Cell::Str(self_ct),
-                Cell::Str(self_iv),
-                Cell::Str(self_spk),
-                Cell::F64(ts),
-                Cell::Str(msg_type),
-                Cell::Str(""),
-            ],
-        )
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        db_ops::append(&messages, row)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        self_row = [
+            Cell::Str(&self_id),
+            Cell::Str(sender),
+            Cell::Str(recipient),
+            Cell::Str("self"),
+            Cell::Str(self_ct),
+            Cell::Str(self_iv),
+            Cell::Str(self_spk),
+            Cell::F64(ts),
+            Cell::Str(msg_type),
+            Cell::Str(""),
+        ];
+        rows.push(&self_row);
     }
+
+    let batch = db_ops::mixed_rows(db::messages_schema(), &rows)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    db_ops::append(&messages, batch)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     let relay = json!({
         "type": "dm",

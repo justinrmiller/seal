@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Array, Float64Array, RecordBatch, StringArray};
 use axum::extract::{Path as AxPath, Query, State};
@@ -10,20 +9,13 @@ use uuid::Uuid;
 
 use crate::auth::require_auth;
 use crate::db;
-use crate::db_ops::{self, Cell};
+use crate::db_ops::{self, now_secs, Cell};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AfterQuery, ChannelEncryptedEnvelope, ChannelMessagePayload, StoredMessage, TokenQuery,
 };
 use crate::validate::{validate_after, validate_id, validate_username};
 use crate::AppState;
-
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
 
 async fn assert_channel_member(
     state: &AppState,
@@ -187,6 +179,14 @@ pub async fn store_channel_message(
     let ts = now_secs();
 
     let attachment_id = if let (Some(att), "image") = (payload.attachment.as_ref(), msg_type) {
+        // Reject oversized attachments before writing them to (object) storage.
+        // The bound is on the encrypted payload the client sent.
+        let max = state.cfg.max_image_size_bytes;
+        if att.encrypted_data.len() > max {
+            return Err(AppError::PayloadTooLarge(format!(
+                "Attachment exceeds the maximum size of {max} bytes"
+            )));
+        }
         let id = Uuid::new_v4().to_string();
         let att_table = db_ops::open(&state.conn, "attachments").await?;
         let row = db_ops::mixed_row(

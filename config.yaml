@@ -27,6 +27,11 @@ database:
 # For safe CONCURRENT writes against real AWS S3, use DynamoDB commit locking by
 # pointing the path at "s3+ddb://my-bucket/chat.lance" and adding a lock table,
 # e.g. `aws_dynamodb_table: "seal-commit-lock"`. Plain "s3://" is single-writer.
+#
+# On object storage the connect retry budget defaults to 30s (so an unreachable
+# bucket fails fast instead of hanging ~180s). Override with:
+#   client_retry_timeout: "60"   # seconds of total retry wall-clock
+#   client_max_retries: "5"      # retry attempts
 
 auth:
   jwt_algorithm: "HS256"

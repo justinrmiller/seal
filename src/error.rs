@@ -13,6 +13,8 @@ pub enum AppError {
     Forbidden(&'static str),
     #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("Too many requests. Try again later.")]
     TooManyRequests,
     #[error("internal error: {0}")]
@@ -26,6 +28,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, (*msg).to_string()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, (*msg).to_string()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             AppError::TooManyRequests => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many requests. Try again later.".to_string(),
@@ -80,6 +83,11 @@ mod tests {
                 AppError::NotFound("missing".into()),
                 StatusCode::NOT_FOUND,
                 "missing",
+            ),
+            (
+                AppError::PayloadTooLarge("too big".into()),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too big",
             ),
             (
                 AppError::TooManyRequests,

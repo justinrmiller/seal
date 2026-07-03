@@ -67,16 +67,27 @@ pub async fn connect(
         .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", location.display()))?;
 
     let remote = is_object_store_uri(path_str);
+    let mut options = storage_options.clone();
     if remote {
         // Object storage: hand the URI to LanceDB and let object_store manage it.
-        // No local directory to create.
+        // No local directory to create. Bound the retry budget so an unreachable
+        // bucket fails fast (lance-io's default is 180s) — the operator can still
+        // override via the `storage:` block. `client_retry_timeout` is the exact
+        // case-insensitive key lance-io reads from this map.
+        if !options
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("client_retry_timeout"))
+        {
+            options.insert("client_retry_timeout".to_string(), "30".to_string());
+        }
     } else if let Some(parent) = location.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating data directory {}", parent.display()))?;
     }
 
     let mut builder = lancedb::connect(path_str);
-    if !storage_options.is_empty() {
-        builder = builder.storage_options(storage_options.clone());
+    if !options.is_empty() {
+        builder = builder.storage_options(options);
     }
     builder.execute().await.with_context(|| {
         let redacted = redact_location(path_str);
