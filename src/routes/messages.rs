@@ -1,24 +1,21 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
+use arrow_array::{Array, Float64Array, RecordBatch, StringArray};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::Json;
+use lancedb::arrow::arrow_schema::SchemaRef;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::require_auth;
 use crate::db;
-use crate::db_ops::{self, Cell};
+use crate::db_ops::{self, now_secs, Cell};
 use crate::error::{AppError, AppResult};
-use crate::models::{AfterQuery, ChannelMessagePayload, StoredMessage, TokenQuery};
+use crate::models::{
+    AfterQuery, ChannelEncryptedEnvelope, ChannelMessagePayload, StoredMessage, TokenQuery,
+};
 use crate::validate::{validate_after, validate_id, validate_username};
 use crate::AppState;
-
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
 
 async fn assert_channel_member(
     state: &AppState,
@@ -182,6 +179,14 @@ pub async fn store_channel_message(
     let ts = now_secs();
 
     let attachment_id = if let (Some(att), "image") = (payload.attachment.as_ref(), msg_type) {
+        // Reject oversized attachments before writing them to (object) storage.
+        // The bound is on the encrypted payload the client sent.
+        let max = state.cfg.max_image_size_bytes;
+        if att.encrypted_data.len() > max {
+            return Err(AppError::PayloadTooLarge(format!(
+                "Attachment exceeds the maximum size of {max} bytes"
+            )));
+        }
         let id = Uuid::new_v4().to_string();
         let att_table = db_ops::open(&state.conn, "attachments").await?;
         let row = db_ops::mixed_row(
@@ -201,29 +206,29 @@ pub async fn store_channel_message(
         String::new()
     };
 
-    let messages = db_ops::open(&state.conn, "messages").await?;
     let msg_group_id = Uuid::new_v4().to_string();
-    let mut per_envelope_ids = Vec::with_capacity(payload.envelopes.len());
+    // One row per envelope, written in a SINGLE append. On object storage each
+    // append is a commit (a network round-trip and, on plain S3, a concurrent-
+    // write hazard), so batching all envelopes into one commit cuts both.
+    let per_envelope_ids: Vec<String> = payload
+        .envelopes
+        .iter()
+        .map(|_| Uuid::new_v4().to_string())
+        .collect();
 
-    for env in &payload.envelopes {
-        let msg_id = Uuid::new_v4().to_string();
-        let row = db_ops::mixed_row(
+    if !payload.envelopes.is_empty() {
+        let messages = db_ops::open(&state.conn, "messages").await?;
+        let batch = build_messages_batch(
             db::messages_schema(),
-            &[
-                Cell::Str(&msg_id),
-                Cell::Str(sender),
-                Cell::Str(&env.target_user),
-                Cell::Str(channel_id),
-                Cell::Str(&env.ciphertext),
-                Cell::Str(&env.iv),
-                Cell::Str(&env.sender_public_key_jwk),
-                Cell::F64(ts),
-                Cell::Str(msg_type),
-                Cell::Str(&attachment_id),
-            ],
+            sender,
+            channel_id,
+            ts,
+            msg_type,
+            &attachment_id,
+            &payload.envelopes,
+            &per_envelope_ids,
         )?;
-        db_ops::append(&messages, row).await?;
-        per_envelope_ids.push(msg_id);
+        db_ops::append(&messages, batch).await?;
     }
 
     Ok(ChannelMessageStoreResult {
@@ -233,4 +238,98 @@ pub async fn store_channel_message(
         message_type: msg_type.to_string(),
         per_envelope_ids,
     })
+}
+
+/// Build a multi-row `messages` batch — one row per envelope — so all envelopes
+/// of a channel message are persisted in a single LanceDB commit. Mirrors the
+/// batch pattern used by `channels::build_member_batch`.
+#[allow(clippy::too_many_arguments)]
+fn build_messages_batch(
+    schema: SchemaRef,
+    sender: &str,
+    channel_id: &str,
+    timestamp: f64,
+    message_type: &str,
+    attachment_id: &str,
+    envelopes: &[ChannelEncryptedEnvelope],
+    ids: &[String],
+) -> Result<RecordBatch, AppError> {
+    let n = envelopes.len();
+    let id_col: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+    let sender_col: Vec<&str> = (0..n).map(|_| sender).collect();
+    let recipient_col: Vec<&str> = envelopes.iter().map(|e| e.target_user.as_str()).collect();
+    let channel_col: Vec<&str> = (0..n).map(|_| channel_id).collect();
+    let ciphertext_col: Vec<&str> = envelopes.iter().map(|e| e.ciphertext.as_str()).collect();
+    let iv_col: Vec<&str> = envelopes.iter().map(|e| e.iv.as_str()).collect();
+    let spk_col: Vec<&str> = envelopes
+        .iter()
+        .map(|e| e.sender_public_key_jwk.as_str())
+        .collect();
+    let ts_col: Vec<f64> = (0..n).map(|_| timestamp).collect();
+    let mtype_col: Vec<&str> = (0..n).map(|_| message_type).collect();
+    let att_col: Vec<&str> = (0..n).map(|_| attachment_id).collect();
+
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(StringArray::from(id_col)),
+        Arc::new(StringArray::from(sender_col)),
+        Arc::new(StringArray::from(recipient_col)),
+        Arc::new(StringArray::from(channel_col)),
+        Arc::new(StringArray::from(ciphertext_col)),
+        Arc::new(StringArray::from(iv_col)),
+        Arc::new(StringArray::from(spk_col)),
+        Arc::new(Float64Array::from(ts_col)),
+        Arc::new(StringArray::from(mtype_col)),
+        Arc::new(StringArray::from(att_col)),
+    ];
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("messages batch: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(target: &str, ct: &str) -> ChannelEncryptedEnvelope {
+        ChannelEncryptedEnvelope {
+            target_user: target.to_string(),
+            ciphertext: ct.to_string(),
+            iv: "iv".to_string(),
+            sender_public_key_jwk: "spk".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_messages_batch_makes_one_row_per_envelope() {
+        let envelopes = vec![env("alice", "ct-a"), env("bob", "ct-b"), env("cara", "ct-c")];
+        let ids: Vec<String> = vec!["m1".into(), "m2".into(), "m3".into()];
+        let batch = build_messages_batch(
+            db::messages_schema(),
+            "sender",
+            "chan-1",
+            42.0,
+            "text",
+            "att-1",
+            &envelopes,
+            &ids,
+        )
+        .expect("batch");
+
+        // One row per envelope, in a single batch (a single append/commit).
+        assert_eq!(batch.num_rows(), 3);
+        let msgs = db_ops::rows_to_stored_messages(&[batch]);
+        assert_eq!(
+            msgs.iter().map(|m| m.recipient.as_str()).collect::<Vec<_>>(),
+            vec!["alice", "bob", "cara"]
+        );
+        assert_eq!(
+            msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3"]
+        );
+        // Constant columns are applied to every row.
+        assert!(msgs.iter().all(|m| m.sender == "sender"
+            && m.channel_id == "chan-1"
+            && m.timestamp == 42.0
+            && m.message_type == "text"
+            && m.attachment_id == "att-1"));
+    }
 }

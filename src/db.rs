@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use anyhow::Context;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::connection::Connection;
 use lancedb::table::NewColumnTransform;
+
+use crate::config::{is_object_store_uri, redact_location};
 
 pub fn users_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -55,15 +58,51 @@ pub fn channel_members_schema() -> SchemaRef {
     ]))
 }
 
-pub async fn connect(path: &std::path::Path) -> anyhow::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let path_str = path
+pub async fn connect(
+    location: &std::path::Path,
+    storage_options: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Connection> {
+    let path_str = location
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", path.display()))?;
-    let conn = lancedb::connect(path_str).execute().await?;
-    Ok(conn)
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 database path: {}", location.display()))?;
+
+    let remote = is_object_store_uri(path_str);
+    let mut options = storage_options.clone();
+    if remote {
+        // Object storage: hand the URI to LanceDB and let object_store manage it.
+        // No local directory to create. Bound the retry budget so an unreachable
+        // bucket fails fast (lance-io's default is 180s) — the operator can still
+        // override via the `storage:` block. `client_retry_timeout` is the exact
+        // case-insensitive key lance-io reads from this map.
+        if !options
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("client_retry_timeout"))
+        {
+            options.insert("client_retry_timeout".to_string(), "30".to_string());
+        }
+    } else if let Some(parent) = location.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating data directory {}", parent.display()))?;
+    }
+
+    let mut builder = lancedb::connect(path_str);
+    if !options.is_empty() {
+        builder = builder.storage_options(options);
+    }
+    builder.execute().await.with_context(|| {
+        let redacted = redact_location(path_str);
+        if remote {
+            // Remote failures are usually credentials/region/endpoint/TLS, none
+            // of which LanceDB's raw error makes obvious.
+            format!(
+                "connecting to object-store database at {redacted}. Check the bucket exists and \
+                 that credentials, region, and endpoint are set (via the `storage:` block or \
+                 standard cloud env vars); for a custom HTTP endpoint set `allow_http=true`."
+            )
+        } else {
+            format!("connecting to database at {redacted}")
+        }
+    })
 }
 
 pub async fn init_db(conn: &Connection) -> anyhow::Result<()> {

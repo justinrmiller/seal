@@ -1,9 +1,6 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use seal_server::{
-    build_router, config::Config, db, rate_limit::RateLimiter, ws::WsConnections, AppState,
-};
+use seal_server::{config::Config, run};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,25 +19,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.app_port
     );
 
-    let conn = db::connect(&cfg.database_path).await?;
-    db::init_db(&conn).await?;
-
-    let state = AppState {
-        cfg: cfg.clone(),
-        conn,
-        rate_limiter: Arc::new(RateLimiter::new()),
-        ws_connections: Arc::new(WsConnections::new()),
-    };
-
-    let app = build_router(state);
-
-    let addr: SocketAddr = format!("{}:{}", cfg.app_host, cfg.app_port).parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("listening on http://{}", listener.local_addr()?);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    // All wiring lives in `seal_server::run` (bootstrap + bind + serve) so it is
+    // exercised by tests; `main` is just the process/tracing entrypoint.
+    run(cfg).await
 }

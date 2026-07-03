@@ -1,18 +1,98 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::Deserialize;
 
+/// URI schemes that address object storage rather than the local filesystem.
+/// A `database.path` beginning with one of these is handed to LanceDB verbatim
+/// (no project-root joining, no local directory creation). `s3+ddb://` is S3
+/// with DynamoDB commit locking, which is the safe way to run concurrent
+/// writers against S3.
+const OBJECT_STORE_SCHEMES: &[&str] = &[
+    "s3://",
+    "s3a://",
+    "s3+ddb://",
+    "gs://",
+    "gcs://",
+    "az://",
+    "azure://",
+    "abfs://",
+    "abfss://",
+];
+
+/// Returns true if `location` is an object-store URI (S3/GCS/Azure) rather than
+/// a local filesystem path. Shared with `db::connect` so both agree on which
+/// locations are remote.
+pub fn is_object_store_uri(location: &str) -> bool {
+    OBJECT_STORE_SCHEMES
+        .iter()
+        .any(|scheme| location.starts_with(scheme))
+}
+
+/// Redact anything credential-like from a database location so it is safe to
+/// log. Object-store URIs don't normally embed credentials, but strip any
+/// `scheme://user:pass@host` userinfo defensively so a secret can never reach
+/// the logs.
+pub fn redact_location(location: &str) -> String {
+    if let Some((scheme, rest)) = location.split_once("://") {
+        if let Some((_userinfo, host)) = rest.split_once('@') {
+            return format!("{scheme}://***@{host}");
+        }
+    }
+    location.to_string()
+}
+
+/// Validate the storage configuration for a resolved database location and
+/// surface operational caveats. Errors on unambiguous misconfiguration; warns
+/// on risky-but-valid setups. Called from [`Config::load`] so problems fail
+/// fast at startup rather than as an opaque connect error later.
+fn validate_storage_config(
+    location: &str,
+    storage_options: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if !is_object_store_uri(location) {
+        // `storage:` options only apply to object storage. Providing them for a
+        // local path is almost certainly a mistake — they'd be silently dropped.
+        if !storage_options.is_empty() {
+            anyhow::bail!(
+                "`storage:` options were provided but the database path ({location}) is a local \
+                 filesystem path, so those options would be silently ignored. Remove the \
+                 `storage:` block, or point the database path at an object-store URI \
+                 (e.g. s3://, gs://, az://)."
+            );
+        }
+        return Ok(());
+    }
+
+    // Plain S3 has no safe concurrent-write story: without DynamoDB commit
+    // locking (the `s3+ddb://` scheme), concurrent writers can clobber one
+    // another's commits. Seal writes messages concurrently, so warn loudly.
+    if location.starts_with("s3://") || location.starts_with("s3a://") {
+        tracing::warn!(
+            "database is on S3 ({}) without DynamoDB commit locking; concurrent writers can \
+             clobber each other's commits. Use the `s3+ddb://` scheme with a lock table (or a \
+             single writer) for production S3.",
+            redact_location(location)
+        );
+    }
+
+    Ok(())
+}
+
 /// Default `config.yaml` baked into the binary at build time. Disk
 /// `config.yaml` at the project root overrides it; env vars override either.
 const EMBEDDED_CONFIG_YAML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml"));
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub app_title: String,
     pub app_host: String,
     pub app_port: u16,
     pub database_path: PathBuf,
+    /// Options passed to LanceDB's storage layer (S3/GCS/Azure credentials,
+    /// endpoint, region, etc.). Empty for local filesystem storage.
+    pub storage_options: HashMap<String, String>,
     pub jwt_secret: String,
     pub jwt_algorithm: String,
     pub token_expire_minutes: i64,
@@ -23,6 +103,31 @@ pub struct Config {
     pub safe_id_re: Regex,
 }
 
+// Hand-written so credentials can never reach logs. `jwt_secret` is masked and
+// `storage_options` (which may hold `aws_secret_access_key`, etc.) is shown as
+// its keys only — values redacted — even if a `Config` is ever `{:?}`-formatted.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut storage_keys: Vec<&str> = self.storage_options.keys().map(|k| k.as_str()).collect();
+        storage_keys.sort_unstable();
+        f.debug_struct("Config")
+            .field("app_title", &self.app_title)
+            .field("app_host", &self.app_host)
+            .field("app_port", &self.app_port)
+            .field("database_path", &self.database_path)
+            .field("storage_options", &format_args!("{storage_keys:?} (values redacted)"))
+            .field("jwt_secret", &"***")
+            .field("jwt_algorithm", &self.jwt_algorithm)
+            .field("token_expire_minutes", &self.token_expire_minutes)
+            .field("username_max_length", &self.username_max_length)
+            .field("id_max_length", &self.id_max_length)
+            .field("max_image_size_bytes", &self.max_image_size_bytes)
+            .field("safe_name_re", &self.safe_name_re)
+            .field("safe_id_re", &self.safe_id_re)
+            .finish()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct YamlConfig {
     app: AppSection,
@@ -31,6 +136,11 @@ struct YamlConfig {
     validation: ValidationSection,
     #[serde(default)]
     attachments: AttachmentsSection,
+    /// Free-form key/value options forwarded to LanceDB's storage layer. Used
+    /// to configure object storage (e.g. `endpoint`, `region`, `allow_http`,
+    /// `aws_access_key_id`). Standard cloud env vars work too when this is empty.
+    #[serde(default)]
+    storage: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,12 +196,32 @@ impl Config {
         let app_host = env_or("APP_HOST", &yaml.app.host);
         let app_port: u16 = env_or_parse("APP_PORT", yaml.app.port)?;
 
-        let database_path = PathBuf::from(env_or("DATABASE_PATH", &yaml.database.path));
-        let database_path = if database_path.is_absolute() {
-            database_path
+        let database_location = env_or("DATABASE_PATH", &yaml.database.path);
+        let remote = is_object_store_uri(&database_location);
+        let database_path = if remote {
+            // Object-store URIs are handed to LanceDB verbatim — never joined
+            // onto the project root or otherwise normalized as a local path.
+            PathBuf::from(&database_location)
         } else {
-            project_root.join(database_path)
+            let database_path = PathBuf::from(&database_location);
+            if database_path.is_absolute() {
+                database_path
+            } else {
+                project_root.join(database_path)
+            }
         };
+
+        // Fail fast on misconfigured storage, and warn on risky-but-valid setups.
+        validate_storage_config(&database_location, &yaml.storage)?;
+        tracing::info!(
+            "database location: {} ({})",
+            redact_location(&database_path.to_string_lossy()),
+            if remote {
+                "object storage"
+            } else {
+                "local filesystem"
+            }
+        );
 
         let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
             tracing::warn!(
@@ -121,6 +251,7 @@ impl Config {
             app_host,
             app_port,
             database_path,
+            storage_options: yaml.storage,
             jwt_secret,
             jwt_algorithm,
             token_expire_minutes,
@@ -154,6 +285,7 @@ impl Config {
             app_host: yaml.app.host,
             app_port: yaml.app.port,
             database_path,
+            storage_options: HashMap::new(),
             jwt_secret,
             jwt_algorithm: yaml.auth.jwt_algorithm,
             token_expire_minutes: yaml.auth.token_expire_minutes,
@@ -226,6 +358,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detects_object_store_uris() {
+        for uri in [
+            "s3://bucket/chat.lance",
+            "s3a://bucket/chat.lance",
+            "gs://bucket/chat.lance",
+            "gcs://bucket/chat.lance",
+            "az://container/chat.lance",
+            "azure://container/chat.lance",
+            "abfs://container/chat.lance",
+            "abfss://container/chat.lance",
+        ] {
+            assert!(is_object_store_uri(uri), "{uri} should be a remote URI");
+        }
+
+        // S3 with DynamoDB commit locking is still object storage.
+        assert!(is_object_store_uri("s3+ddb://bucket/chat.lance"));
+
+        for path in ["data/chat.lance", "/abs/path/chat.lance", "chat.lance"] {
+            assert!(!is_object_store_uri(path), "{path} should be local");
+        }
+    }
+
+    #[test]
+    fn redact_location_strips_userinfo_but_keeps_plain_locations() {
+        // No credentials to hide: returned unchanged.
+        assert_eq!(
+            redact_location("s3://bucket/chat.lance"),
+            "s3://bucket/chat.lance"
+        );
+        assert_eq!(redact_location("data/chat.lance"), "data/chat.lance");
+        // Any embedded userinfo is masked so it can't leak into logs.
+        assert_eq!(
+            redact_location("s3://key:secret@bucket/chat.lance"),
+            "s3://***@bucket/chat.lance"
+        );
+    }
+
+    #[test]
+    fn validate_storage_rejects_options_on_a_local_path() {
+        let mut opts = HashMap::new();
+        opts.insert("aws_region".to_string(), "us-east-1".to_string());
+        // Options on a local path are a misconfiguration: they'd be ignored.
+        assert!(validate_storage_config("data/chat.lance", &opts).is_err());
+        // Same options on a remote URI are fine.
+        assert!(validate_storage_config("s3://bucket/chat.lance", &opts).is_ok());
+    }
+
+    #[test]
+    fn validate_storage_allows_local_path_without_options() {
+        assert!(validate_storage_config("data/chat.lance", &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets() {
+        let mut cfg =
+            Config::for_test(PathBuf::from("data/t.lance"), "super-secret-jwt".into()).unwrap();
+        cfg.storage_options
+            .insert("aws_secret_access_key".into(), "top-secret-value".into());
+        let dbg = format!("{cfg:?}");
+        // Neither the JWT secret nor any storage-option value may appear.
+        assert!(!dbg.contains("super-secret-jwt"), "jwt secret leaked: {dbg}");
+        assert!(!dbg.contains("top-secret-value"), "storage value leaked: {dbg}");
+        // Storage-option keys are safe to show; secrets read as ***.
+        assert!(dbg.contains("aws_secret_access_key"));
+        assert!(dbg.contains("***"));
+    }
+
+    #[test]
+    fn remote_database_path_is_stored_verbatim() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_db = std::env::var("DATABASE_PATH").ok();
+        let prev_root = std::env::var("SEAL_PROJECT_ROOT").ok();
+
+        // A project root that would corrupt the URI if it were joined.
+        std::env::set_var("SEAL_PROJECT_ROOT", "/tmp/seal-test-root-xyz");
+        std::env::set_var("DATABASE_PATH", "s3://my-bucket/chat.lance");
+
+        let cfg = Config::load().expect("load config");
+        assert_eq!(
+            cfg.database_path,
+            PathBuf::from("s3://my-bucket/chat.lance"),
+            "remote URI must be passed through without project-root joining"
+        );
+
+        match prev_db {
+            Some(v) => std::env::set_var("DATABASE_PATH", v),
+            None => std::env::remove_var("DATABASE_PATH"),
+        }
+        match prev_root {
+            Some(v) => std::env::set_var("SEAL_PROJECT_ROOT", v),
+            None => std::env::remove_var("SEAL_PROJECT_ROOT"),
+        }
+    }
+
     /// All process-global env vars that `Config::load` reads. Snapshotted and
     /// restored around each load() test so they don't leak between tests.
     const LOAD_ENV_KEYS: &[&str] = &[
@@ -281,6 +508,8 @@ mod tests {
         assert_eq!(cfg.jwt_secret, "change-me");
         // Relative database path is anchored to the project root.
         assert_eq!(cfg.database_path, root.path().join("data/chat.lance"));
+        // No object-store options for a plain local path.
+        assert!(cfg.storage_options.is_empty());
 
         restore(&saved);
     }

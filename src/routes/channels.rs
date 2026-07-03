@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Array, Float64Array, RecordBatch, StringArray};
 use axum::extract::{Path as AxPath, Query, State};
@@ -10,7 +9,7 @@ use uuid::Uuid;
 
 use crate::auth::require_auth;
 use crate::db;
-use crate::db_ops::{self, Cell};
+use crate::db_ops::{self, now_secs, Cell};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AddChannelMemberRequest, ChannelBrowseItem, ChannelInfo, ChannelMemberKey,
@@ -18,13 +17,6 @@ use crate::models::{
 };
 use crate::validate::{validate_id, validate_username};
 use crate::AppState;
-
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
 
 async fn list_channel_member_usernames(
     state: &AppState,
